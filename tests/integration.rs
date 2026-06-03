@@ -338,3 +338,48 @@ fn timeout_kills_a_hung_test() {
         .code(1)
         .stdout(predicate::str::contains("timed out"));
 }
+
+// ---------------------------------------------------------------------------
+// --durations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn durations_lists_slowest_tests() {
+    tezt("parametrize")
+        .args(["--durations", "3"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("slowest"));
+}
+
+// ---------------------------------------------------------------------------
+// The collection cache is transparent: a warm run matches a cold run.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn collection_cache_is_transparent_across_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_cached.py"),
+        "def test_one():\n    assert True\n\ndef test_two():\n    assert 1 + 1 == 2\n",
+    )
+    .expect("write suite");
+
+    // Two consecutive cached runs (cache enabled by default) must agree, and the
+    // second one must have a cache directory to read from.
+    for _ in 0..2 {
+        let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+        cmd.current_dir(dir.path())
+            .env("TEZT_PYTHON", test_python())
+            .arg("--color")
+            .arg("never")
+            .arg(".");
+        cmd.assert()
+            .code(0)
+            .stdout(predicate::str::contains("2 passed"));
+    }
+    assert!(
+        dir.path().join(".tezt_cache").is_dir(),
+        "a warm run should have populated .tezt_cache"
+    );
+}
