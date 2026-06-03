@@ -6,79 +6,49 @@
 
 [![CI](https://github.com/BilagoNet/tezt/actions/workflows/ci.yml/badge.svg)](https://github.com/BilagoNet/tezt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#roadmap)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-*"tez" means "fast" in Uzbek. tezt sounds like "test". That's the whole pitch.*
+*"tez" means "fast" in Uzbek, and tezt sounds like "test". That's the whole pitch.*
 
 </div>
 
 ---
 
-## Highlights
+tezt runs Python tests. It is built around two ideas that make it quick: it discovers
+your tests by **parsing them in Rust** — no imports, no plugin loading — and it runs them
+on a **pool of Python workers that start once and stay warm**, so you pay interpreter
+startup a handful of times per run instead of once per test.
 
-- ⚡ **Near-instant collection.** Test files are parsed with a Rust AST parser — no Python imports needed to discover your tests.
-- 🚀 **Parallel by default.** Tests run on a pool of persistent Python worker processes (`-j N`), so interpreter startup cost is paid once, not per test.
-- 🐍 **Finds your interpreter.** Honors an active virtualenv, `$CONDA_PREFIX`, and a project-local `.venv` (walking up to the project root) before falling back to `python3` — so tests run against the dependencies you actually installed.
-- 🗃 **Warm collection cache.** Parse results are cached per file (keyed by size + mtime); unchanged files are never re-parsed, so repeat collection is near-instant.
-- 🔍 **pytest-style discovery.** `test_*.py` / `*_test.py` files, `test_*` functions, `Test*` classes — your suite layout just works.
-- 🧩 **Fixtures, parametrize, marks.** Function/module/session-scoped fixtures with yield teardown, `conftest.py`, `parametrize`, `skip`/`skipif`/`xfail`, async tests, and xunit setup/teardown hooks.
-- 🤝 **Works with pytest decorators.** `@pytest.fixture` and `@pytest.mark.parametrize` are understood without pytest installed — or use the zero-dependency `import tezt` API.
-- 🛠 **Builtins included.** `tmp_path`, `tmp_path_factory`, and `monkeypatch` work out of the box.
-- 📋 **Rich failures.** Assertion failures are enriched with the failing source line and local variables.
-- 🔢 **pytest-compatible exit codes** (`0` pass, `1` failures, `5` no tests collected) for drop-in CI use.
-- 🧹 **Clean interrupts.** Ctrl-C (or a CI `kill`) tears down every worker process group — no orphaned Python processes left behind.
+The difference shows up on anything non-trivial. On a generated suite of 10,000 tests
+across 500 files, listing the tests takes tezt about **20 ms** where pytest takes about
+**10 s**, and the full run takes **~0.2 s** against pytest's **~13 s**. Numbers and how to
+reproduce them are in [Performance](#performance).
 
-## Benchmarks
+It aims to run ordinary pytest-style suites without changes — fixtures, `parametrize`,
+marks, `conftest.py`, async tests, the xunit `setup_*`/`teardown_*` hooks — and it reads
+both the attributes pytest's decorators produce and a small built-in [`import tezt`](#using-an-existing-suite)
+API, so a project that doesn't have pytest installed can still run its tests under tezt.
 
-<!-- BENCH:START -->
-Median of 5 end-to-end runs on an 11-core Apple Silicon machine, Python 3.9, against a
-generated suite of **10,000 tests across 500 files** (`bench/`). tezt's collection cache is
-**disabled** here, so this is a raw parse-vs-import comparison — reproduce with
-[`bench/RESULTS.md`](bench/RESULTS.md).
+## Status
 
-| phase | tezt | pytest | pytest -n 8 | speedup |
-| --- | ---: | ---: | ---: | ---: |
-| **collection** (`--collect-only`) | **0.019 s** | 10.11 s | — | **543× faster** |
-| **full run** (10,000 tests) | **0.19 s** | 13.27 s | 19.53 s | **72× faster** |
-| **cold start** (1 test) | **0.061 s** | 0.58 s | — | **9.4× faster** |
-
-tezt parses tests in Rust (no imports), runs them on a warm pool of persistent workers, and
-is parallel by default — ~0.02 ms per test. Note that `pytest -n 8` (xdist) is *slower* than
-plain pytest here: per-process distribution overhead dwarfs the work of trivial tests, which
-is exactly the case tezt's persistent workers are built for.
-
-**Warm collection cache:** on a second run, unchanged files skip parsing entirely (just stat
-+ decode a cached entry) — another ~1.5× on this suite, and much more on larger real-world
-test files where parsing dominates.
-<!-- BENCH:END -->
-
-## Installation
-
-tezt is alpha software. For now, build from source:
-
-```sh
-git clone https://github.com/BilagoNet/tezt
-cd tezt
-cargo build --release
-# binary at ./target/release/tezt
-```
-
-Prebuilt binaries and `uv tool install tezt` are coming soon.
+Alpha. The core runner is stable and the test suite runs on **Linux, macOS, and Windows**
+against **CPython 3.9 through 3.14** (every push is checked across that matrix in CI). What
+isn't done yet — plugins, assertion rewriting, a few fixture scopes — is listed honestly in
+[Compatibility](#compatibility) and the [Roadmap](#roadmap). If your suite leans on the
+pytest plugin ecosystem, keep using pytest; see the [FAQ](#faq).
 
 ## Quickstart
 
-Write tests the way you already do:
-
 ```python
 # test_math.py
-import pytest
+import tezt
 
 
 def test_addition():
     assert 1 + 1 == 2
 
 
-@pytest.mark.parametrize("n,squared", [(2, 4), (3, 9), (4, 16)])
+@tezt.parametrize("n,squared", [(2, 4), (3, 9), (4, 16)])
 def test_squares(n, squared):
     assert n * n == squared
 
@@ -88,105 +58,220 @@ def test_wrong_addition():
     assert total == 5
 ```
 
-Run them:
+Point tezt at the directory (or just run it with no arguments in your project):
 
-```sh
-tezt
+```console
+$ tezt
+collected 5 tests in 6ms
+python: .venv/bin/python3
+
+FAILED test_math.py::test_wrong_addition
+  assert failed: assert total == 5 | locals: total=4
+  Traceback (most recent call last):
+    File "test_math.py", line 15, in test_wrong_addition
+      assert total == 5
+  AssertionError
+
+4 passed, 1 failed in 0.07s
 ```
 
-```text
-tezt 0.1.0 — collected 5 tests in 0.002s (2 workers)
+`tezt -v` prints a line per test instead of a progress counter; `tezt -q` prints only the
+summary. The exit code follows pytest's convention — `0` all passed, `1` failures or
+errors, `5` nothing collected — so it drops into CI unchanged.
 
-test_math.py::test_addition PASSED
-test_math.py::test_squares[2-4] PASSED
-test_math.py::test_squares[3-9] PASSED
-test_math.py::test_squares[4-16] PASSED
-test_math.py::test_wrong_addition FAILED
+## Using an existing suite
 
-FAILURES ────────────────────────────────────────────────
+There are two ways to write tests, and tezt understands both.
 
-test_math.py::test_wrong_addition
-    assert total == 5
-    locals: total = 4
+**The built-in API**, which needs nothing installed:
 
-──────────────────────────────── 4 passed, 1 failed in 0.09s
+```python
+import tezt
+
+@tezt.fixture
+def client():
+    c = make_client()
+    yield c
+    c.close()
+
+@tezt.parametrize("value", [1, 2, 3])
+def test_positive(value, client):
+    assert client.check(value) > 0
 ```
 
-## pytest compatibility
+`tezt` provides `fixture`, `parametrize`, `mark.skip`/`skipif`/`xfail`, `raises`, `skip`,
+`fail`, and `xfail`, plus the builtin fixtures `tmp_path`, `tmp_path_factory`, and
+`monkeypatch`.
 
-tezt aims to run idiomatic pytest suites unmodified. Many real-world suites work today; suites that lean on plugins or pytest internals do not (yet).
+**Plain pytest-style tests** also work — tezt recognizes the markers `@pytest.fixture`
+and `@pytest.mark.*` leave on your functions. The one caveat is the obvious one: a file
+that says `import pytest` needs pytest installed to import, because tezt does not fake the
+`pytest` module. If you want a zero-dependency suite, use `import tezt`.
 
-| Supported | Not yet |
+## Compatibility
+
+tezt is not a pytest reimplementation; it's a fast runner for the common subset. Here's
+where the line currently sits.
+
+| Works today | Not yet |
 | --- | --- |
-| Discovery: `test_*.py`, `*_test.py`, `test_*` functions, `Test*` classes | pytest plugin ecosystem |
-| Fixtures: function / module / session scope, yield teardown, `conftest.py` | Assertion rewriting (pytest's introspection magic) |
-| `@pytest.mark.parametrize` | Custom marks API |
-| `skip` / `skipif` / `xfail` / `xpass` | `pdb`, `--lf`, `--ff` |
-| Async tests | Coverage integration |
-| xunit setup/teardown hooks (`setup_method`, `setup_class`, …) | Class-scoped fixtures |
-| Builtin `tmp_path`, `tmp_path_factory`, `monkeypatch` | Async fixtures |
-| `@pytest.fixture` & friends — no pytest install required | |
-| Zero-dep `import tezt` API | |
-| Exit codes `0` / `1` / `5` | |
+| `test_*.py` / `*_test.py`, `test_*` functions, `Test*` classes | The pytest plugin ecosystem (`pytest-mock`, `-django`, `-cov`, …) |
+| Fixtures: function / module / session scope, `yield` teardown, `conftest.py` chains | Assertion rewriting (pytest's per-operator introspection) |
+| `parametrize`, including stacked decorators and `ids=` | Class-scoped fixtures, async fixtures |
+| `skip` / `skipif` / `xfail` / `xpass` | Mark expressions (`-m`) |
+| `async def` tests (run on a fresh event loop each) | `--lf` / `--ff`, `pdb`, coverage |
+| xunit hooks: `setup_module`, `setup_class`, `setup_method`, and teardowns | Custom plugin hooks / `pytest_*` |
+| Builtins: `tmp_path`, `tmp_path_factory`, `monkeypatch` | |
+| Reads `@pytest.fixture` / `@pytest.mark.*`, or the zero-dep `import tezt` API | |
+
+Failures show the assertion's source line and the locals in scope, which covers most of
+what assertion rewriting gives you without the rewriting. Rich per-operator diffs are on
+the roadmap.
+
+## Performance
+
+Median of 5 end-to-end runs (wall time around `subprocess.run`) on an 11-core Apple Silicon
+machine, against a generated suite of **10,000 tests in 500 files**. The collection cache is
+turned off here so this is an honest parse-versus-import comparison; the harness lives in
+[`bench/`](bench/) and the full table is regenerated into [`bench/RESULTS.md`](bench/RESULTS.md).
+
+| Phase | tezt | pytest | pytest -n 8 (xdist) |
+| --- | ---: | ---: | ---: |
+| Collect (`--collect-only`) | **0.019 s** | 10.11 s | — |
+| Full run | **0.19 s** | 13.27 s | 19.53 s |
+| Cold start (1 test) | **0.061 s** | 0.58 s | — |
+
+A couple of things worth saying plainly. The collection gap is large because pytest imports
+every module to discover tests while tezt only parses them. The full-run gap is mostly the
+per-test overhead: tezt spends about **0.02 ms** of its own time per test, so on trivial
+tests the wall time is dominated by interpreter and dispatch costs that the warm worker pool
+amortizes away. And `pytest -n 8` is *slower* than plain pytest on this suite — xdist's
+per-process distribution costs more than the tests themselves when each test is cheap, which
+is exactly the workload persistent workers are built for. On tests that actually do work, the
+gap narrows to whatever your test bodies cost, as it should.
+
+The collection cache (on by default) takes this further on repeat runs: unchanged files skip
+parsing entirely and are reconstructed from a per-file entry keyed on size and mtime. That's
+another ~1.5× on this trivial suite and considerably more on real files where parsing isn't
+free.
 
 ## CLI reference
 
 | Flag | Description |
 | --- | --- |
-| `-k EXPRESSION` | Only run tests matching the expression |
-| `-x`, `--maxfail` | Stop after the first failure (or after N failures) |
-| `-j N`, `--jobs N` | Number of parallel worker processes |
-| `-v` / `-q` | Increase / decrease output verbosity |
-| `--collect-only` | Collect and list tests without running them |
-| `--json` | Emit a machine-readable JSON report |
-| `--no-capture` | Don't capture stdout/stderr from tests |
-| `--durations` | Show the slowest tests |
-| `--python EXE` | Interpreter to run workers with (also `TEZT_PYTHON`); overrides discovery |
-| `--no-cache` | Disable the persistent collection cache for this run |
-| `--clear-cache` | Delete the collection cache (`.tezt_cache`) before running |
+| `-k EXPRESSION` | Run only tests whose id matches the expression (`and` / `or` / `not`, parentheses) |
+| `-x` / `--maxfail N` | Stop after the first failure, or after N failures/errors |
+| `-j N` / `--jobs N` | Number of worker processes (default: CPU count) |
+| `-v` / `-q` | One line per test / summary only |
+| `-s` / `--no-capture` | Don't capture test stdout/stderr |
+| `--collect-only` | List the tests that would run, then exit |
+| `--durations N` | Print the N slowest tests |
+| `--json PATH` | Write a machine-readable JSON report |
+| `--python EXE` | Interpreter for the workers (also `$TEZT_PYTHON`); accepts a path or an `X.Y` version |
+| `--no-cache` / `--clear-cache` | Skip / delete the collection cache for this run |
+| `--color WHEN` | `auto` (default), `always`, or `never` |
+
+## Configuration
+
+tezt is configured by flags and a few environment variables; there is no config file yet.
+
+- **`TEZT_PYTHON`** — the interpreter to run workers with. When unset, tezt looks for an
+  active virtualenv (`$VIRTUAL_ENV`), then `$CONDA_PREFIX`, then a project-local `.venv`
+  (walking up to the project root), then `python3`/`python` on `PATH`. This is why tests run
+  against the dependencies you actually installed rather than the system interpreter.
+- **`NO_COLOR`** — disables color, same as `--color never` (respects the [standard](https://no-color.org)).
+- **`TEZT_DEBUG=1`** — logs internal detail to stderr, including any file whose static parse
+  fell back to import-time discovery.
+- **`.tezt_cache/`** — the per-project collection cache. It's safe to delete and is marked so
+  backup tools skip it; add it to `.gitignore` (tezt writes one inside the directory too).
+
+## Installation
+
+For now, build from source with a recent stable Rust toolchain:
+
+```sh
+git clone https://github.com/BilagoNet/tezt
+cd tezt
+cargo build --release
+# the binary is at ./target/release/tezt
+```
+
+Prebuilt binaries, an install script, and `pip install tezt` / `uv tool install tezt` are
+planned — see the [Roadmap](#roadmap).
 
 ## How it works
 
-tezt splits the work between Rust and Python. Collection never touches a Python interpreter: a Rust AST parser scans your test files and builds the test list directly. Execution happens on a pool of persistent Python workers that stay warm between tests, communicating with the scheduler over a JSON-lines protocol — so per-test dispatch overhead is amortized to well under a millisecond.
+Collection and execution are split between the two languages, each doing what it's good at.
+
+Collection stays entirely in Rust: a parser walks each test file's syntax tree and builds the
+list of tests directly, so discovering a suite never starts a Python interpreter. Execution
+runs on a pool of worker processes that import each module once and then sit waiting for work,
+talking to the scheduler over a line-delimited JSON protocol on stdin/stdout. Because the
+workers are persistent, the cost of dispatching one more test is a JSON write and read —
+well under a millisecond — instead of a process launch.
 
 ```mermaid
 flowchart LR
-    A["Rust collector<br/>(AST parse, no imports)"] --> B[Scheduler]
-    B -->|JSON-lines| W1[Python worker 1]
-    B -->|JSON-lines| W2[Python worker 2]
-    B -->|JSON-lines| WN[Python worker N]
-    W1 --> R[Live reporter]
+    A["Rust collector<br/>(parse, no imports)"] --> B[Scheduler]
+    B -->|JSON lines| W1[worker 1]
+    B -->|JSON lines| W2[worker 2]
+    B -->|JSON lines| WN[worker N]
+    W1 --> R[reporter]
     W2 --> R
     WN --> R
 ```
 
+Interrupting a run is handled carefully, because a half-killed run that leaves Python
+processes behind is worse than no speedup at all. Each worker runs in its own process group on
+Unix and inside a kill-on-close Job Object on Windows, and a Ctrl-C handler tears the whole
+tree down — so an interrupted run never orphans a worker or a subprocess one of your tests
+spawned.
+
 ## Roadmap
 
-- [ ] Assertion rewriting
-- [ ] Plugin API
-- [ ] Watch mode
-- [ ] Coverage integration
+Roughly in the order it's likely to happen:
+
+- [ ] Prebuilt binaries + `pip` / `uv tool` distribution
+- [ ] Per-test timeouts for hung tests
+- [ ] Rich assertion diffs (operator-aware), beyond source line + locals
 - [ ] Mark expressions (`-m`)
-- [ ] pip / uv distribution
-- [ ] Class-scoped fixtures
+- [ ] Class-scoped and async fixtures
+- [ ] `--lf` / `--ff` (last-failed / failed-first)
+- [ ] A plugin API, and coverage integration
 
 ## FAQ
 
-**Why not just use pytest?**
-You probably should, for most projects — pytest is mature, extensible, and battle-tested. tezt exists for the cases where test-loop latency matters: huge suites, tight TDD loops, CI bills. Collection that takes pytest seconds takes tezt milliseconds, and persistent workers remove the per-run interpreter tax.
+**Should I switch off pytest?**
+For most projects, no — pytest is mature, extensible, and has an enormous plugin ecosystem
+that tezt doesn't try to replace. tezt is for the cases where the test loop itself is the
+bottleneck: large suites, tight edit-run cycles, CI minutes. If you live in those, the
+collection and startup savings are hard to give up; if you don't, pytest is the safer choice.
+
+**Will my existing suite run?**
+If it sticks to fixtures, `parametrize`, marks, and `conftest.py`, there's a good chance it
+runs unchanged. If it depends on plugins or on pytest's assertion rewriting, it won't yet —
+the [compatibility table](#compatibility) is the honest boundary.
 
 **How is this different from karva, rtest, or maelstrom?**
-Honestly: we're all part of the same wave of exploring what Rust tooling can do for Python testing, the way uv and ruff did for packaging and linting. tezt's particular bet is the combination of persistent-worker amortized sub-millisecond dispatch and zero-config pytest-style UX — point it at an existing suite and it should just run, fast.
+They're all worth a look — this is a small wave of people asking what Rust can do for Python
+testing, the way uv and ruff did for packaging and linting. tezt's particular bet is the
+combination of static (no-import) collection, a warm worker pool with sub-millisecond
+dispatch, and running ordinary suites with no configuration.
 
-**Does my existing pytest suite work?**
-Many do. If your suite uses standard fixtures, parametrize, marks, and conftest.py, there's a good chance it runs unmodified. If it depends on pytest plugins (pytest-mock, pytest-django, pytest-cov, …) or assertion-rewriting magic, it won't yet — see the compatibility table above.
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: `cargo test` runs the Rust unit
+and integration tests, `python python/test_worker_protocol.py` exercises the worker protocol
+directly, and `bench/` has the benchmark harness. CI runs all of it across the OS and Python
+matrix.
 
 ## Acknowledgements
 
-- [Astral](https://astral.sh)'s [uv](https://github.com/astral-sh/uv) and [ruff](https://github.com/astral-sh/ruff), which showed what Rust tooling for Python can feel like — and whose READMEs this one openly imitates.
-- [pytest](https://pytest.org), whose design tezt borrows liberally and whose ergonomics set the bar.
-- Bootstrapped with [Claude](https://claude.ai).
+tezt borrows pytest's design and ergonomics — its test layout, fixtures, and marks set the
+bar this tries to meet. The architecture takes after [Astral](https://astral.sh)'s
+[uv](https://github.com/astral-sh/uv) and [ruff](https://github.com/astral-sh/ruff): a fast
+Rust core doing the heavy lifting for a Python workflow.
 
 ## License
 
-tezt is licensed under the [MIT License](LICENSE).
+[MIT](LICENSE).

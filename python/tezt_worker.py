@@ -809,7 +809,20 @@ def _enrich_assertion(exc, exc_tb, test_file):
 
 
 def _format_traceback(exc, limit_lines=TRACEBACK_LINES):
-    lines = tb_module.format_exception(type(exc), exc, exc.__traceback__)
+    # Hide tezt's own worker frames so the traceback starts at the user's test,
+    # the way pytest hides its framework frames. We drop the leading frames whose
+    # file is this worker module (run_case and the call plumbing).
+    tb = exc.__traceback__
+    worker_file = globals().get("__file__")
+    if worker_file:
+        worker_file = os.path.normcase(os.path.abspath(worker_file))
+        while tb is not None:
+            frame_file = os.path.normcase(os.path.abspath(tb.tb_frame.f_code.co_filename))
+            if frame_file == worker_file:
+                tb = tb.tb_next
+            else:
+                break
+    lines = tb_module.format_exception(type(exc), exc, tb)
     text = "".join(lines)
     rows = text.splitlines()
     if len(rows) > limit_lines:
