@@ -1,0 +1,96 @@
+  perf: 2000 tests in 0.08s -> 0.038 ms/test
+
+[core outcomes / parametrize / marks]
+  ok    batch_done batch_id matches
+  ok    plain pass
+  ok    stdout captured
+  ok    stderr captured
+  ok    duration_ms numeric
+  ok    bare assert -> failed
+  ok    assertion enrichment has source + locals
+  ok    failed has traceback
+  ok    assert with message
+  ok    mark.skip
+  ok    tezt.skip()
+  ok    skipif True
+  ok    skipif False
+  ok    xfail failing
+  ok    xfail passing -> xpassed
+  ok    parametrize id [1]
+  ok    parametrize id [2]
+  ok    parametrize id [3]
+  ok    parametrize expands to 3 flat cases
+  ok    multi-arg param ids joined with '-'
+  ok    cartesian product yields 4 cases
+  ok    cartesian ids inner-first, innermost varies fastest
+  ok    ids= kwarg overrides
+  ok    None/bool/float id rendering
+  ok    tezt.raises match ok
+  ok    tezt.raises DID NOT RAISE -> failed
+  ok    body exception -> failed with message
+  ok    shutdown -> bye, exit 0
+
+[fixtures / conftest / scopes / builtins]
+  ok    root conftest fixture injected
+  ok    conftest fixture depending on parent conftest fixture
+  ok    module fixture overrides conftest (nearest wins)
+  ok    yield fixture value
+  ok    LIFO teardown order
+  ok    module-scope fixture cached
+  ok    session fixture v1
+  ok    monkeypatch works
+  ok    monkeypatch auto-undo
+  ok    tmp_path usable
+  ok    tmp_path fresh per test
+  ok    tmp_path_factory.mktemp
+  ok    unknown fixture -> error 'not found'
+  ok    second batch_done has batch_id 2
+  ok    session fixture persists across batches/modules
+  ok    scoped fixtures injected
+  ok    module-scope yield teardown fires on module switch
+  ok    session-scope teardown deferred until shutdown
+  ok    fixtures worker clean shutdown
+  ok    session-scope yield teardown fires at shutdown
+
+[classes / xunit / async / '*' discovery / import errors]
+  ok    class method test passes
+  ok    fresh instance per method
+  ok    xunit hook sequence
+  ok    async test passes via asyncio.run
+  ok    async test failure detected
+  ok    '*' discovery ids exact
+  ok    '*' cases pass
+  ok    broken module -> error per item
+  ok    import error traceback mentions SyntaxError
+  ok    batch_done emitted after error batch
+  ok    discovery worker clean shutdown
+
+[pytest compatibility shims]
+  ok    module-level pytestmark (single Mark)
+  ok    classic _pytestfixturefunction fixture injected (99)
+  ok    pytest>=8.4 FixtureFunctionDefinition fixture injected
+  ok    function pytestmark skip
+  ok    pytestmark parametrize expands
+  ok    class-level pytestmark applies to methods
+  ok    'Skipped' class-name suffix -> skipped
+  ok    compat worker clean shutdown
+
+[misc: no-capture / truncation / async fixture / fixture cycle]
+  ok    no-capture keeps stdout field
+  ok    no-capture tees to worker stderr
+  ok    no-capture worker says bye
+  ok    stdout truncated at 64KB
+  ok    async fixture -> clear error
+  ok    fixture dependency cycle detected
+  ok    misc worker clean shutdown
+
+[performance: 2000 trivial tests]
+  ok    all 2000 perf results received
+  ok    all perf tests passed
+  ok    2000 tests under 8s
+  ok    perf worker clean shutdown
+
+========================================
+self-test: 78 passed, 0 failed
+measured worker overhead: 0.038 ms per trivial test
+========================================

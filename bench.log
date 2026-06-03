@@ -1,0 +1,23 @@
+suite_path=/tmp/suite_ci
+test_cases=500
+suite: /tmp/suite_ci  (nominal 500 test cases)
+runs per measurement: 3; jobs: 4; xdist: yes
+
+[collection]
+  tezt collect                 median 0.0035s  min 0.0032  max 0.0037  count 500
+  pytest collect               median 0.8095s  min 0.8078  max 0.8868  count 500
+
+[full run]
+  tezt -j 4                    median 0.0895s  min 0.0891  max 0.0920  count 500
+  pytest                       median 1.0199s  min 1.0105  max 1.0225  count 500
+  pytest -n 4 (xdist)          median 1.4069s  min 1.4057  max 1.4244  count 500
+
+[cold start: 1 file / 1 test, full run]
+  tezt cold (1 test)           median 0.0785s
+  pytest cold (1 test)         median 0.2245s
+
+Headline: tezt runs 500 tests in 0.09s (0.18 ms/test) -- 11.4x faster than pytest.
+
+wrote /home/runner/work/tezt/tezt/bench-results.json
+wrote /home/runner/work/tezt/tezt/RESULTS.md
+bench exit: 0

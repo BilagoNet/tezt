@@ -1,0 +1,58 @@
+[1m[92m   Compiling[0m wait-timeout v0.2.1
+[1m[92m   Compiling[0m tezt v0.1.0 (/home/runner/work/tezt/tezt)
+[1m[92m   Compiling[0m assert_cmd v2.2.2
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 33.33s
+[1m[92m     Running[0m unittests src/main.rs (target/release/deps/tezt-f56a9a9d9dca2e70)
+
+running 24 tests
+test cache::tests::cached_item_round_trips_via_json ... ok
+test cache::tests::disabled_cache_is_noop ... ok
+test cache::tests::cold_miss_then_warm_hit ... ok
+test cache::tests::clear_removes_cache_dir ... ok
+test cache::tests::corrupt_entry_is_a_miss ... ok
+test cache::tests::entry_path_is_sharded_and_stable ... ok
+test cache::tests::new_creates_marker_files ... ok
+test cache::tests::mtime_change_invalidates ... ok
+test cache::tests::size_change_invalidates ... ok
+test cache::tests::version_change_invalidates ... ok
+test collect::tests::static_parametrize_simple ... ok
+test collect::tests::static_parametrize_cartesian ... ok
+test collect::tests::collects_functions_and_classes ... ok
+test kexpr::tests::and_or_not ... ok
+test collect::tests::syntax_error_goes_dynamic ... ok
+test collect::tests::static_parametrize_tuples_and_ids ... ok
+test kexpr::tests::bad_exprs ... ok
+test collect::tests::unknown_parametrize_values ... ok
+test kexpr::tests::parens ... ok
+test python::tests::explicit_absolute_path_wins ... ok
+test python::tests::label_annotates_only_venvs ... ok
+test python::tests::discovers_dot_venv_by_walking_up ... ok
+test kexpr::tests::case_insensitive ... ok
+test kexpr::tests::simple_substring ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/integration.rs (target/release/deps/integration-6422d2b574d8e440)
+
+running 18 tests
+test collect_only_reports_counts ... ok
+test empty_dir_exits_5 ... ok
+test asyncio_suite_counts ... ok
+test classes_suite_all_pass ... ok
+test basic_suite_counts_and_exit_code ... ok
+test failures_suite_failures_and_collection_error ... ok
+test fixtures_suite_all_pass ... ok
+test k_filter_matching_nothing_exits_5 ... ok
+test json_report_is_valid_and_well_shaped ... ok
+test k_filter_single_substring ... ok
+test kfilter_suite_all_pass ... ok
+test parametrize_suite_expands_to_16_cases ... ok
+test k_filter_boolean_expressions_and_class_name ... ok
+test jobs_1_and_4_produce_identical_counts ... ok
+test skips_suite_skip_xfail_xpass_counts ... ok
+test pytest_compat_collects_17_tests ... ok
+test x_flag_stops_before_reporting_all_failures ... ok
+test pytest_compat_suite_counts ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+
