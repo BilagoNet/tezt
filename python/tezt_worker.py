@@ -293,12 +293,18 @@ _conftest_chain_cache = {}  # dir path -> ordered list of conftest modules
 
 
 def module_name_for(path):
-    rel = os.path.relpath(path, ROOTDIR)
+    try:
+        rel = os.path.relpath(path, ROOTDIR)
+    except ValueError:
+        # Windows: `path` and ROOTDIR are on different drives/mounts (tests on
+        # another drive than the working dir). relpath can't express that, so
+        # derive the name from the drive-stripped absolute path instead.
+        rel = os.path.splitdrive(os.path.abspath(path))[1]
     if rel.endswith(".py"):
         rel = rel[:-3]
     name = rel.replace(os.sep, ".").replace("/", ".")
-    # Make path-derived names safe-ish module identifiers
-    return name.lstrip(".")
+    # Make path-derived names safe-ish module identifiers.
+    return name.strip(".")
 
 
 def import_module_from_path(path):

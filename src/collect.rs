@@ -163,8 +163,13 @@ fn rel_id(file: &Path, rootdir: &Path) -> String {
 }
 
 fn collect_file(file: &Path, rootdir: &Path, cache: Option<&Cache>) -> Result<CollectedFile> {
+    // `dunce::canonicalize` resolves symlinks like `std::fs::canonicalize` but,
+    // on Windows, strips the `\\?\` verbatim prefix. Without that, the absolute
+    // path handed to the worker (`\\?\D:\...`) and the rootdir it compares
+    // against (`D:\...`) look like different mounts, and `os.path.relpath`
+    // raises `ValueError: path is on mount ...`.
     let abs =
-        fs_err::canonicalize(file).with_context(|| format!("cannot resolve {}", file.display()))?;
+        dunce::canonicalize(file).with_context(|| format!("cannot resolve {}", file.display()))?;
     let rel = rel_id(file, rootdir);
 
     // Freshness key from the file's metadata (size + mtime + tezt version).

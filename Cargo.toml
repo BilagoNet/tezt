@@ -14,6 +14,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 ctrlc = "3"
+dunce = "1"
 fs-err = "3"
 ignore = "0.4"
 mimalloc = "0.1"
