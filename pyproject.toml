@@ -1,0 +1,36 @@
+# tezt ships as a compiled binary wrapped in a Python wheel, so `pip install tezt`
+# and `uv tool install tezt` drop the `tezt` executable on PATH without a Rust
+# toolchain. maturin (bindings = "bin") does the packaging; the crate itself is
+# built from Cargo.toml as usual.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tezt"
+description = "An extremely fast Python test runner, written in Rust."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "BilagoNet" }]
+keywords = ["testing", "test-runner", "pytest", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/BilagoNet/tezt"
+Issues = "https://github.com/BilagoNet/tezt/issues"
+
+[tool.maturin]
+# Package the compiled `tezt` binary (not a Python extension module).
+bindings = "bin"
+manifest-path = "Cargo.toml"
+strip = true

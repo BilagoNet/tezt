@@ -197,8 +197,11 @@ cargo build --release
 # the binary is at ./target/release/tezt
 ```
 
-Prebuilt binaries, an install script, and `pip install tezt` / `uv tool install tezt` are
-planned — see the [Roadmap](#roadmap).
+You can also build an installable wheel with [maturin](https://www.maturin.rs)
+(`maturin build --release`) — it packages the `tezt` binary so `pip install` drops it on
+your PATH, no Rust toolchain required. Every tagged release builds wheels for Linux, macOS,
+and Windows and attaches them to the GitHub Release; once a version is published to PyPI,
+`pip install tezt` and `uv tool install tezt` work directly.
 
 ## How it works
 
