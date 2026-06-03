@@ -1,8 +1,16 @@
 //! tezt — an extremely fast Python test runner, written in Rust.
 
+// mimalloc: collection parses many files in parallel (rayon), so allocation
+// is hot and multi-threaded — exactly where a per-thread-arena allocator beats
+// the system one. Same reason uv/ruff ship a custom global allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+mod cache;
 mod cli;
 mod collect;
 mod kexpr;
+mod python;
 mod report;
 mod runner;
 
@@ -50,8 +58,20 @@ fn run() -> Result<i32> {
     };
 
     // --- collection ---------------------------------------------------------
+    // Persistent collection cache: unchanged files skip read+parse on warm
+    // runs. `--clear-cache` wipes it first (best-effort); `--no-cache` disables
+    // it entirely for this run.
+    if args.clear_cache {
+        let _ = cache::Cache::clear(&rootdir);
+    }
+    let cache = if args.no_cache {
+        None
+    } else {
+        Some(cache::Cache::new(&rootdir, true))
+    };
+
     let collect_start = Instant::now();
-    let collected_files = collect::collect(&paths, &rootdir)?;
+    let collected_files = collect::collect(&paths, &rootdir, cache.as_ref())?;
     let mut items: Vec<collect::TestItem> = collected_files
         .into_iter()
         .flat_map(|f| f.items)
@@ -113,12 +133,13 @@ fn run() -> Result<i32> {
     }
 
     // --- execution ------------------------------------------------------------
-    let jobs = args
-        .jobs
-        .unwrap_or_else(num_cpus::get)
-        .max(1);
+    let jobs = args.jobs.unwrap_or_else(num_cpus::get).max(1);
+    let python = python::resolve_python(args.python_override().as_deref(), &rootdir);
+    if !args.quiet {
+        println!("{}", style.dim(&format!("python: {}", python::label(&python))));
+    }
     let cfg = runner::RunConfig {
-        python: args.python_exe(),
+        python,
         rootdir: rootdir.clone(),
         jobs,
         no_capture: args.no_capture,

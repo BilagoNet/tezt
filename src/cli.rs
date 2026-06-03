@@ -65,6 +65,14 @@ pub struct Cli {
     /// Python executable used to run workers (also: TEZT_PYTHON env var)
     #[arg(long = "python", value_name = "EXE")]
     pub python: Option<String>,
+
+    /// Disable the persistent collection cache for this run
+    #[arg(long = "no-cache")]
+    pub no_cache: bool,
+
+    /// Delete the collection cache (.tezt_cache) before running
+    #[arg(long = "clear-cache")]
+    pub clear_cache: bool,
 }
 
 impl Cli {
@@ -93,16 +101,16 @@ impl Cli {
         }
     }
 
-    /// Python executable to use for workers.
-    pub fn python_exe(&self) -> String {
+    /// Explicit Python override from `--python` or `$TEZT_PYTHON`, if any.
+    /// Full discovery (active venv, `$CONDA_PREFIX`, project `.venv`, `PATH`)
+    /// happens in [`crate::python::resolve_python`] when this returns `None`.
+    pub fn python_override(&self) -> Option<String> {
         if let Some(p) = &self.python {
-            return p.clone();
+            return Some(p.clone());
         }
-        if let Ok(p) = std::env::var("TEZT_PYTHON") {
-            if !p.is_empty() {
-                return p;
-            }
+        match std::env::var("TEZT_PYTHON") {
+            Ok(p) if !p.is_empty() => Some(p),
+            _ => None,
         }
-        "python3".to_string()
     }
 }

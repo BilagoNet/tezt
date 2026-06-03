@@ -18,17 +18,38 @@
 
 - ⚡ **Near-instant collection.** Test files are parsed with a Rust AST parser — no Python imports needed to discover your tests.
 - 🚀 **Parallel by default.** Tests run on a pool of persistent Python worker processes (`-j N`), so interpreter startup cost is paid once, not per test.
+- 🐍 **Finds your interpreter.** Honors an active virtualenv, `$CONDA_PREFIX`, and a project-local `.venv` (walking up to the project root) before falling back to `python3` — so tests run against the dependencies you actually installed.
+- 🗃 **Warm collection cache.** Parse results are cached per file (keyed by size + mtime); unchanged files are never re-parsed, so repeat collection is near-instant.
 - 🔍 **pytest-style discovery.** `test_*.py` / `*_test.py` files, `test_*` functions, `Test*` classes — your suite layout just works.
 - 🧩 **Fixtures, parametrize, marks.** Function/module/session-scoped fixtures with yield teardown, `conftest.py`, `parametrize`, `skip`/`skipif`/`xfail`, async tests, and xunit setup/teardown hooks.
 - 🤝 **Works with pytest decorators.** `@pytest.fixture` and `@pytest.mark.parametrize` are understood without pytest installed — or use the zero-dependency `import tezt` API.
 - 🛠 **Builtins included.** `tmp_path`, `tmp_path_factory`, and `monkeypatch` work out of the box.
 - 📋 **Rich failures.** Assertion failures are enriched with the failing source line and local variables.
 - 🔢 **pytest-compatible exit codes** (`0` pass, `1` failures, `5` no tests collected) for drop-in CI use.
+- 🧹 **Clean interrupts.** Ctrl-C (or a CI `kill`) tears down every worker process group — no orphaned Python processes left behind.
 
 ## Benchmarks
 
 <!-- BENCH:START -->
-_Benchmarks coming soon._
+Median of 5 end-to-end runs on an 11-core Apple Silicon machine, Python 3.9, against a
+generated suite of **10,000 tests across 500 files** (`bench/`). tezt's collection cache is
+**disabled** here, so this is a raw parse-vs-import comparison — reproduce with
+[`bench/RESULTS.md`](bench/RESULTS.md).
+
+| phase | tezt | pytest | pytest -n 8 | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| **collection** (`--collect-only`) | **0.019 s** | 10.11 s | — | **543× faster** |
+| **full run** (10,000 tests) | **0.19 s** | 13.27 s | 19.53 s | **72× faster** |
+| **cold start** (1 test) | **0.061 s** | 0.58 s | — | **9.4× faster** |
+
+tezt parses tests in Rust (no imports), runs them on a warm pool of persistent workers, and
+is parallel by default — ~0.02 ms per test. Note that `pytest -n 8` (xdist) is *slower* than
+plain pytest here: per-process distribution overhead dwarfs the work of trivial tests, which
+is exactly the case tezt's persistent workers are built for.
+
+**Warm collection cache:** on a second run, unchanged files skip parsing entirely (just stat
++ decode a cached entry) — another ~1.5× on this suite, and much more on larger real-world
+test files where parsing dominates.
 <!-- BENCH:END -->
 
 ## Installation
@@ -120,6 +141,9 @@ tezt aims to run idiomatic pytest suites unmodified. Many real-world suites work
 | `--json` | Emit a machine-readable JSON report |
 | `--no-capture` | Don't capture stdout/stderr from tests |
 | `--durations` | Show the slowest tests |
+| `--python EXE` | Interpreter to run workers with (also `TEZT_PYTHON`); overrides discovery |
+| `--no-cache` | Disable the persistent collection cache for this run |
+| `--clear-cache` | Delete the collection cache (`.tezt_cache`) before running |
 
 ## How it works
 

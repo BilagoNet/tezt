@@ -25,8 +25,16 @@ fn suite(name: &str) -> PathBuf {
 }
 
 /// A `tezt` command pre-configured with `--color never` and the given suite.
+///
+/// Pins the worker interpreter to `python3` via `TEZT_PYTHON` so these tests
+/// exercise tezt's run/report logic deterministically, independent of the
+/// machine's interpreter-discovery surface (an ambient `$VIRTUAL_ENV`, a stray
+/// project `.venv`, etc.). Discovery itself is covered by unit tests in
+/// `src/python.rs`. `pytest_compat` needs the same interpreter that
+/// `pytest_available()` probes — which is exactly `python3` on PATH.
 fn tezt(suite_name: &str) -> Command {
     let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.env("TEZT_PYTHON", "python3");
     cmd.arg("--color").arg("never").arg(suite(suite_name));
     cmd
 }

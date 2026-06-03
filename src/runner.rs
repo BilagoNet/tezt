@@ -5,19 +5,89 @@
 use crate::collect::TestItem;
 use anyhow::{Context, Result};
 use crossbeam_channel as channel;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// The embedded Python worker, shipped inside the tezt binary.
 pub const WORKER_SOURCE: &str = include_str!("../python/tezt_worker.py");
 
 const BATCH_CHUNK: usize = 64;
+
+// --- process cleanup machinery ----------------------------------------------
+//
+// Three layers of defense ensure no orphaned Python workers (or grandchildren
+// they spawned) survive a Ctrl-C, kill, panic, or early return:
+//   1. each worker runs in its own process group (so a kill reaches the whole
+//      subtree), see `Worker::spawn`;
+//   2. a `Drop` impl force-terminates the group as a backstop (panics / early
+//      `?` returns in worker threads);
+//   3. a process-wide Ctrl-C / SIGTERM handler kills every live group, below.
+
+/// Registry of live worker process-group ids (== worker pid on unix). A pgid is
+/// inserted on successful spawn and removed on reap. The Ctrl-C handler walks
+/// this set to terminate every outstanding worker subtree.
+static LIVE_WORKERS: Mutex<Option<FxHashSet<i32>>> = Mutex::new(None);
+
+/// Process-global stop flag. The signal handler sets this; `run_tests` also
+/// threads it through the per-run `Arc<AtomicBool>` used for --maxfail, so a
+/// signal interrupts in-flight scheduling the same way --maxfail does.
+static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ensures the Ctrl-C / SIGTERM handler is installed at most once per process.
+static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Record a freshly-spawned worker's process-group id in the global registry.
+fn register_worker(pgid: i32) {
+    let mut guard = LIVE_WORKERS.lock().unwrap();
+    guard.get_or_insert_with(FxHashSet::default).insert(pgid);
+}
+
+/// Remove a worker's process-group id once it has been reaped.
+fn unregister_worker(pgid: i32) {
+    if let Some(set) = LIVE_WORKERS.lock().unwrap().as_mut() {
+        set.remove(&pgid);
+    }
+}
+
+/// Install the process-wide interrupt handler exactly once. On SIGINT/SIGTERM
+/// (or a Windows Ctrl-C event) it flips the global stop flag, best-effort kills
+/// every registered worker process group, and exits 130 (128 + SIGINT).
+fn install_signal_handler() {
+    if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        return; // already installed this process
+    }
+    // `ctrlc` catches SIGINT/SIGTERM on unix and Ctrl-C/Ctrl-Break on Windows.
+    // Ignore an "already set" error so this stays safe if some other code also
+    // registered a handler.
+    let _ = ctrlc::set_handler(move || {
+        SHOULD_STOP.store(true, Ordering::SeqCst);
+        let pgids: Vec<i32> = LIVE_WORKERS
+            .lock()
+            .map(|g| g.as_ref().map(|s| s.iter().copied().collect()).unwrap_or_default())
+            .unwrap_or_default();
+        for pgid in pgids {
+            #[cfg(unix)]
+            unsafe {
+                // SAFETY: killpg only signals the process group `pgid`; we own
+                // these groups (one per worker we spawned). Best-effort: the
+                // group may already be gone, which is fine.
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pgid; // no process-group kill on non-unix here
+            }
+        }
+        // Conventional shell exit code for a SIGINT-interrupted program.
+        std::process::exit(130);
+    });
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -33,16 +103,6 @@ pub enum Outcome {
 impl Outcome {
     pub fn is_bad(self) -> bool {
         matches!(self, Outcome::Failed | Outcome::Error)
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Outcome::Passed => "passed",
-            Outcome::Failed => "failed",
-            Outcome::Skipped => "skipped",
-            Outcome::Xfailed => "xfailed",
-            Outcome::Xpassed => "xpassed",
-            Outcome::Error => "error",
-        }
     }
 }
 
@@ -153,6 +213,14 @@ struct Worker {
     child: Child,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
+    /// Process-group id of the worker. On unix this equals the worker's pid
+    /// (we put each worker in its own group via `process_group(0)`), and a
+    /// `killpg` on it reaches the worker plus any grandchildren it spawned.
+    /// On non-unix this is unused (we kill the child directly).
+    pgid: i32,
+    /// Set once the worker has been reaped through `shutdown`/`kill` so the
+    /// `Drop` backstop knows not to signal/wait a second time.
+    reaped: bool,
 }
 
 impl Worker {
@@ -170,16 +238,31 @@ impl Worker {
         if no_capture {
             cmd.arg("--no-capture");
         }
+        // Layer 1: put the worker in its own process group so a single kill
+        // (killpg) reaches the worker *and* any grandchildren a test spawned.
+        // `process_group(0)` makes the child's pgid equal its own pid. This is
+        // the clean std API (no hand-rolled pre_exec). No-op on non-unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to start Python worker (`{python}`)"))?;
+        // On unix the pgid equals the pid thanks to `process_group(0)`.
+        let pgid = child.id() as i32;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut w = Worker {
             child,
             stdin,
             stdout,
+            pgid,
+            reaped: false,
         };
+        // Layer 3 bookkeeping: make this group visible to the signal handler.
+        register_worker(pgid);
         // Handshake.
         match w.read_event()? {
             Some(WireEvent::Ready { .. }) => Ok(w),
@@ -221,10 +304,16 @@ impl Worker {
     }
 
     fn shutdown(mut self) {
+        // Graceful path: ask the worker to run session teardowns, wait for its
+        // `bye`, then reap. Marking `reaped` first means the `Drop` backstop
+        // (which runs when `self` falls out of scope here) is a no-op — normal
+        // completion never force-kills.
         let _ = self.send(&WireCmd::Shutdown);
-        // Give the worker a moment to run session teardowns, then reap.
         let _ = self.read_until_bye();
         let _ = self.child.wait();
+        unregister_worker(self.pgid);
+        self.reaped = true;
+        // `self` drops here; Drop sees `reaped == true` and does nothing.
     }
 
     fn read_until_bye(&mut self) -> Result<()> {
@@ -238,8 +327,51 @@ impl Worker {
     }
 
     fn kill(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Explicit force-kill path (worker died mid-batch / --maxfail). Reap the
+        // whole process group, then mark `reaped` so Drop doesn't repeat it.
+        self.force_kill_group();
+        unregister_worker(self.pgid);
+        self.reaped = true;
+    }
+
+    /// Force-terminate the worker's entire process group (worker + any
+    /// grandchildren). Shared by `kill` and the `Drop` backstop.
+    fn force_kill_group(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            // SAFETY: `killpg` only signals our own worker's process group
+            // (pgid == the worker pid we spawned with `process_group(0)`).
+            // SIGTERM first for a chance at orderly shutdown, a brief grace,
+            // then SIGKILL to guarantee nothing in the subtree survives. Both
+            // calls are best-effort: the group may already be gone.
+            libc::killpg(self.pgid, libc::SIGTERM);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            libc::killpg(self.pgid, libc::SIGKILL);
+            // Reap the worker itself so it doesn't linger as a zombie.
+            let _ = self.child.wait();
+        }
+        #[cfg(not(unix))]
+        {
+            // No process groups here; kill the direct child and reap it.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Drop for Worker {
+    /// Layer 2: kill-on-drop backstop. If a worker is dropped without having
+    /// been reaped through `shutdown`/`kill` — e.g. a panic or an early `?`
+    /// return unwinds a worker thread — force-terminate its process group so no
+    /// Python worker (or grandchild) is orphaned. After a clean shutdown
+    /// `reaped` is already true, so this is a no-op and never double-kills.
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.force_kill_group();
+        unregister_worker(self.pgid);
+        self.reaped = true;
     }
 }
 
@@ -274,6 +406,10 @@ pub fn run_tests<F>(items: Vec<TestItem>, cfg: &RunConfig, mut on_result: F) -> 
 where
     F: FnMut(&TestResult),
 {
+    // Layer 3: install the process-wide Ctrl-C / SIGTERM handler once. It kills
+    // every registered worker process group and exits 130 on interrupt.
+    install_signal_handler();
+
     let started = Instant::now();
     let batches = make_batches(items);
     let n_batches = batches.len();
@@ -313,7 +449,7 @@ where
         handles.push(std::thread::spawn(move || -> Result<()> {
             let mut worker: Option<Worker> = None;
             while let Ok(batch) = batch_rx.recv() {
-                if stop.load(Ordering::SeqCst) {
+                if should_stop(&stop) {
                     break;
                 }
                 if worker.is_none() {
@@ -335,7 +471,7 @@ where
                     items: wire_items,
                 })?;
 
-                let mut seen: HashSet<String> = HashSet::new();
+                let mut seen: FxHashSet<String> = FxHashSet::default();
                 let mut worker_died = false;
                 loop {
                     match w.read_event()? {
@@ -401,12 +537,12 @@ where
                         w.kill();
                     }
                 }
-                if stop.load(Ordering::SeqCst) {
+                if should_stop(&stop) {
                     break;
                 }
             }
             if let Some(w) = worker.take() {
-                if stop.load(Ordering::SeqCst) {
+                if should_stop(&stop) {
                     w.kill();
                 } else {
                     w.shutdown();
@@ -453,11 +589,17 @@ where
     })
 }
 
+/// True if scheduling should halt: either this run hit --maxfail (`stop`) or a
+/// signal flipped the process-global stop flag.
+fn should_stop(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::SeqCst) || SHOULD_STOP.load(Ordering::SeqCst)
+}
+
 /// Emit `error` results for items of a batch that never produced a result
 /// (worker crash mid-batch).
 fn report_missing(
     batch: &Batch,
-    seen: &HashSet<String>,
+    seen: &FxHashSet<String>,
     res_tx: &channel::Sender<TestResult>,
     message: &str,
     traceback: Option<String>,

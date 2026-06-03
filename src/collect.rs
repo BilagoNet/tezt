@@ -1,6 +1,11 @@
 //! Test collection: walk the filesystem and statically parse Python test
 //! files with a Rust AST parser. No Python interpreter is needed to collect.
+//!
+//! Parsing is collection's dominant cost, so a warm run reuses a persistent
+//! per-file cache ([`crate::cache`]): if a file is unchanged we reconstruct its
+//! items without reading or parsing it.
 
+use crate::cache::{Cache, CachedCollection, CachedItem};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -44,7 +49,12 @@ impl TestItem {
 }
 
 /// Result of collecting one file.
+//
+// `file` and `dynamic` are part of the per-file collection record (useful for
+// debugging and future reporting), even though the run path currently consumes
+// only `items` — hence the targeted `allow`.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct CollectedFile {
     pub file: PathBuf,
     pub rel: String,
@@ -129,11 +139,19 @@ pub fn find_test_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 /// Collect all test items from the given root paths, in parallel.
-pub fn collect(paths: &[PathBuf], rootdir: &Path) -> Result<Vec<CollectedFile>> {
+///
+/// `cache`, when `Some`, lets unchanged files skip read+parse. `Option<&Cache>`
+/// is `Sync`, so each rayon worker shares it without locking (every file owns a
+/// distinct cache entry).
+pub fn collect(
+    paths: &[PathBuf],
+    rootdir: &Path,
+    cache: Option<&Cache>,
+) -> Result<Vec<CollectedFile>> {
     let files = find_test_files(paths)?;
     let mut collected: Vec<CollectedFile> = files
         .par_iter()
-        .map(|f| collect_file(f, rootdir))
+        .map(|f| collect_file(f, rootdir, cache))
         .collect::<Result<Vec<_>>>()?;
     // Keep deterministic order (par_iter preserves order, but be explicit).
     collected.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -145,31 +163,53 @@ fn rel_id(file: &Path, rootdir: &Path) -> String {
     rel.to_string_lossy().replace('\\', "/")
 }
 
-fn collect_file(file: &Path, rootdir: &Path) -> Result<CollectedFile> {
-    let abs = file
-        .canonicalize()
+fn collect_file(file: &Path, rootdir: &Path, cache: Option<&Cache>) -> Result<CollectedFile> {
+    let abs = fs_err::canonicalize(file)
         .with_context(|| format!("cannot resolve {}", file.display()))?;
     let rel = rel_id(file, rootdir);
-    let source = std::fs::read_to_string(&abs)
+
+    // Freshness key from the file's metadata (size + mtime + tezt version).
+    // If we can read it and the cache has a matching entry, reconstruct the
+    // result without reading or parsing the source.
+    let key = fs_err::metadata(&abs).ok().map(|m| crate::cache::file_key(&m));
+    if let (Some(cache), Some(key)) = (cache, &key) {
+        if let Some(hit) = cache.get(&abs, key) {
+            return Ok(from_cache(hit, &abs, &rel));
+        }
+    }
+
+    let source = fs_err::read_to_string(&abs)
         .with_context(|| format!("cannot read {}", abs.display()))?;
 
-    let parsed = ast::Suite::parse(&source, &rel);
+    let collected = parse_file(&source, &abs, &rel);
+
+    // Best-effort write-through: only when we have a cache and a freshness key.
+    if let (Some(cache), Some(key)) = (cache, key) {
+        cache.put(&abs, &to_cache(&collected, key));
+    }
+    Ok(collected)
+}
+
+/// Statically parse `source` into a [`CollectedFile`]. Unparseable files fall
+/// back to a single dynamic item the Python worker discovers at import time.
+fn parse_file(source: &str, abs: &Path, rel: &str) -> CollectedFile {
+    let parsed = ast::Suite::parse(source, rel);
     let body = match parsed {
         Ok(b) => b,
         Err(_) => {
             // Unparseable (syntax error or very new syntax): let the Python
             // worker try at import time.
-            return Ok(CollectedFile {
+            return CollectedFile {
                 items: vec![TestItem {
-                    id: rel.clone(),
-                    file: abs.clone(),
+                    id: rel.to_string(),
+                    file: abs.to_path_buf(),
                     qualname: "*".to_string(),
                     param_ids: None,
                 }],
-                file: abs,
-                rel,
+                file: abs.to_path_buf(),
+                rel: rel.to_string(),
                 dynamic: true,
-            });
+            };
         }
     };
 
@@ -178,12 +218,12 @@ fn collect_file(file: &Path, rootdir: &Path) -> Result<CollectedFile> {
         match stmt {
             ast::Stmt::FunctionDef(f) if f.name.as_str().starts_with("test") => {
                 if is_test_name(f.name.as_str()) {
-                    items.push(make_item(&rel, &abs, f.name.as_str(), None, &f.decorator_list));
+                    items.push(make_item(rel, abs, f.name.as_str(), None, &f.decorator_list));
                 }
             }
             ast::Stmt::AsyncFunctionDef(f) => {
                 if is_test_name(f.name.as_str()) {
-                    items.push(make_item(&rel, &abs, f.name.as_str(), None, &f.decorator_list));
+                    items.push(make_item(rel, abs, f.name.as_str(), None, &f.decorator_list));
                 }
             }
             ast::Stmt::ClassDef(c) if c.name.as_str().starts_with("Test") => {
@@ -194,8 +234,8 @@ fn collect_file(file: &Path, rootdir: &Path) -> Result<CollectedFile> {
                     match sub {
                         ast::Stmt::FunctionDef(m) if is_test_name(m.name.as_str()) => {
                             items.push(make_item(
-                                &rel,
-                                &abs,
+                                rel,
+                                abs,
                                 m.name.as_str(),
                                 Some(c.name.as_str()),
                                 &m.decorator_list,
@@ -203,8 +243,8 @@ fn collect_file(file: &Path, rootdir: &Path) -> Result<CollectedFile> {
                         }
                         ast::Stmt::AsyncFunctionDef(m) if is_test_name(m.name.as_str()) => {
                             items.push(make_item(
-                                &rel,
-                                &abs,
+                                rel,
+                                abs,
                                 m.name.as_str(),
                                 Some(c.name.as_str()),
                                 &m.decorator_list,
@@ -218,12 +258,53 @@ fn collect_file(file: &Path, rootdir: &Path) -> Result<CollectedFile> {
         }
     }
 
-    Ok(CollectedFile {
-        file: abs,
-        rel,
+    CollectedFile {
+        file: abs.to_path_buf(),
+        rel: rel.to_string(),
         items,
         dynamic: false,
-    })
+    }
+}
+
+/// Reconstruct a [`CollectedFile`] from a cache hit. The absolute path and
+/// `rel` id are not stored in the entry — they are re-derived from the file
+/// being collected (the same path that produced the cache digest).
+fn from_cache(hit: CachedCollection, abs: &Path, rel: &str) -> CollectedFile {
+    let items = hit
+        .items
+        .into_iter()
+        .map(|c| TestItem {
+            id: c.id,
+            file: abs.to_path_buf(),
+            qualname: c.qualname,
+            param_ids: c.param_ids,
+        })
+        .collect();
+    CollectedFile {
+        file: abs.to_path_buf(),
+        rel: rel.to_string(),
+        items,
+        dynamic: hit.dynamic,
+    }
+}
+
+/// Build a cache entry from a freshly collected file. The absolute path is
+/// intentionally dropped (reconstructed on load).
+fn to_cache(collected: &CollectedFile, key: crate::cache::FileCacheKey) -> CachedCollection {
+    let items = collected
+        .items
+        .iter()
+        .map(|i| CachedItem {
+            id: i.id.clone(),
+            qualname: i.qualname.clone(),
+            param_ids: i.param_ids.clone(),
+        })
+        .collect();
+    CachedCollection {
+        key,
+        items,
+        dynamic: collected.dynamic,
+    }
 }
 
 fn is_test_name(name: &str) -> bool {
@@ -425,7 +506,7 @@ mod tests {
         let path = dir.path().join("test_sample.py");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(src.as_bytes()).unwrap();
-        collect_file(&path, dir.path()).unwrap()
+        collect_file(&path, dir.path(), None).unwrap()
     }
 
     #[test]

@@ -16,3 +16,6 @@ bench/results.json
 # Misc
 .DS_Store
 /outputs
+
+# tezt collection cache
+.tezt_cache/

@@ -363,8 +363,12 @@ def main(argv=None):
     # ---- a) collection ----
     print("\n[collection]")
     if run_tezt:
+        # --no-cache: benchmark tezt's raw cold collection (parse every file),
+        # the fair apples-to-apples comparison against pytest (whose own caches
+        # are disabled via -p no:cacheprovider). The collection cache is a real
+        # feature, measured separately so the headline never leans on it.
         add("tezt collect", "tezt", "collect",
-            [tezt_bin, suite, "--collect-only", "-q"],
+            [tezt_bin, suite, "--collect-only", "--no-cache", "-q"],
             expected_cases=expected)
     if run_pytest:
         add("pytest collect", "pytest", "collect",
@@ -380,7 +384,7 @@ def main(argv=None):
     print("\n[full run]")
     if run_tezt:
         add(f"tezt -j {args.jobs}", "tezt", "full",
-            [tezt_bin, suite, "-j", str(args.jobs), "-q"],
+            [tezt_bin, suite, "-j", str(args.jobs), "--no-cache", "-q"],
             expected_cases=expected)
     if run_pytest:
         add("pytest", "pytest", "full",
@@ -402,7 +406,7 @@ def main(argv=None):
             micro, micro_cases = gen_micro_suite(tmp)
             if run_tezt:
                 r = measure("tezt cold (1 test)", "tezt", "full",
-                            [tezt_bin, micro, "-j", "1", "-q"],
+                            [tezt_bin, micro, "-j", "1", "--no-cache", "-q"],
                             runs=args.runs, expected_cases=micro_cases, env=env)
                 cold_results.append(r)
                 print(f"  {r['label']:<28} median {r['median_s']:.4f}s")
