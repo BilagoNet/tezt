@@ -56,8 +56,10 @@ fn unregister_worker(pgid: i32) {
 }
 
 /// Install the process-wide interrupt handler exactly once. On SIGINT/SIGTERM
-/// (or a Windows Ctrl-C event) it flips the global stop flag, best-effort kills
-/// every registered worker process group, and exits 130 (128 + SIGINT).
+/// (or a Windows Ctrl-C/Ctrl-Break event) it flips the global stop flag, kills
+/// every outstanding worker (its process group on unix; the shared Job Object on
+/// Windows), and exits with the conventional interrupted code (130 on unix,
+/// `STATUS_CONTROL_C_EXIT` on Windows).
 fn install_signal_handler() {
     if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
         return; // already installed this process
@@ -67,26 +69,146 @@ fn install_signal_handler() {
     // registered a handler.
     let _ = ctrlc::set_handler(move || {
         SHOULD_STOP.store(true, Ordering::SeqCst);
-        let pgids: Vec<i32> = LIVE_WORKERS
-            .lock()
-            .map(|g| g.as_ref().map(|s| s.iter().copied().collect()).unwrap_or_default())
-            .unwrap_or_default();
-        for pgid in pgids {
-            #[cfg(unix)]
-            unsafe {
-                // SAFETY: killpg only signals the process group `pgid`; we own
-                // these groups (one per worker we spawned). Best-effort: the
-                // group may already be gone, which is fine.
-                libc::killpg(pgid, libc::SIGTERM);
+
+        // unix: signal every worker process group we registered. SIGTERM takes
+        // down the worker plus any grandchildren sharing its group.
+        #[cfg(unix)]
+        {
+            let pgids: Vec<i32> = LIVE_WORKERS
+                .lock()
+                .map(|g| {
+                    g.as_ref()
+                        .map(|s| s.iter().copied().collect())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            for pgid in pgids {
+                // SAFETY: killpg only signals process groups we created (one per
+                // worker via `process_group(0)`). Best-effort; the group may
+                // already be gone.
+                unsafe {
+                    libc::killpg(pgid, libc::SIGTERM);
+                }
             }
-            #[cfg(not(unix))]
-            {
-                let _ = pgid; // no process-group kill on non-unix here
+            // 128 + SIGINT: the conventional code for a Ctrl-C'd program.
+            std::process::exit(130);
+        }
+
+        // Windows: a single TerminateJobObject kills every worker and every
+        // grandchild assigned to the shared job — no per-worker loop needed.
+        #[cfg(windows)]
+        {
+            if let Some(job) = winjob::shared() {
+                job.terminate();
+            }
+            // STATUS_CONTROL_C_EXIT, what cmd.exe reports for a Ctrl-C'd console app.
+            std::process::exit(0xC000_013A_u32 as i32);
+        }
+    });
+}
+
+// --- Windows: Job Object cleanup (the analogue of unix process groups) ------
+//
+// Windows has no process group we can signal. Instead we create ONE Job Object
+// for the whole run, configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and
+// assign every worker to it. When the job's last handle is closed — on clean
+// exit, when the OS closes our handles as the process dies, or when the Ctrl-C
+// handler calls `TerminateJobObject` — Windows terminates every process still in
+// the job: all workers AND any grandchildren a test spawned. Mirrors uv
+// (crates/uv-windows/src/job.rs).
+#[cfg(windows)]
+mod winjob {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// Owns a Job Object handle. Because the job sets
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, closing its last handle terminates
+    /// every process still assigned to it.
+    pub struct WorkerJob {
+        handle: HANDLE,
+    }
+
+    // SAFETY: a Job Object handle is a kernel object whose APIs are thread-safe;
+    // we only read it after creation, so sharing it across threads (it lives in a
+    // `static`) is sound.
+    unsafe impl Send for WorkerJob {}
+    unsafe impl Sync for WorkerJob {}
+
+    impl WorkerJob {
+        fn create() -> Option<Self> {
+            // SAFETY: null name + null security attributes is the documented form
+            // for an anonymous job object; it returns NULL on failure.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let job = WorkerJob { handle };
+
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `handle` is the job we just created; `info` is a
+            // fully-initialized struct for the extended-limit info class and we
+            // pass its real byte length. Returns 0 on failure.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job.handle,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::addr_of!(info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                return None; // `job` drops -> CloseHandle; harmless on a limit-less job
+            }
+            Some(job)
+        }
+
+        /// Assign a freshly-spawned child (and its future descendants) to the job.
+        pub fn assign(&self, child: &Child) {
+            let raw = child.as_raw_handle();
+            // SAFETY: `self.handle` is a valid job; `raw` is the live process
+            // handle owned by `child`. AssignProcessToJobObject only borrows it.
+            unsafe {
+                let _ = AssignProcessToJobObject(self.handle, raw as HANDLE);
             }
         }
-        // Conventional shell exit code for a SIGINT-interrupted program.
-        std::process::exit(130);
-    });
+
+        /// Synchronously terminate every process in the job. Used by the Ctrl-C
+        /// handler, which exits the process immediately afterward.
+        pub fn terminate(&self) {
+            // SAFETY: valid job handle; the exit code for the killed processes is
+            // arbitrary. Best-effort.
+            unsafe {
+                let _ = TerminateJobObject(self.handle, 1);
+            }
+        }
+    }
+
+    impl Drop for WorkerJob {
+        fn drop(&mut self) {
+            // SAFETY: we own `self.handle`. Closing the last handle to a
+            // KILL_ON_JOB_CLOSE job terminates any processes still in it.
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+
+    /// The single Job Object for the process, created on first worker spawn.
+    /// `None` if creation failed (we then fall back to the per-worker kill).
+    static JOB: OnceLock<Option<WorkerJob>> = OnceLock::new();
+
+    pub fn shared() -> Option<&'static WorkerJob> {
+        JOB.get_or_init(WorkerJob::create).as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +374,14 @@ impl Worker {
             .with_context(|| format!("failed to start Python worker (`{python}`)"))?;
         // On unix the pgid equals the pid thanks to `process_group(0)`.
         let pgid = child.id() as i32;
+        // Windows has no process groups; instead assign the worker to a shared
+        // Job Object so it — and anything it spawns — is terminated when the job
+        // closes (on exit/panic/Ctrl-C). Best-effort: the kill-on-drop backstop
+        // still reaps the direct child if assignment fails.
+        #[cfg(windows)]
+        if let Some(job) = winjob::shared() {
+            job.assign(&child);
+        }
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut w = Worker {

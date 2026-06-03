@@ -212,9 +212,9 @@ fn init_cache_dir(cache_dir: &Path) -> std::io::Result<()> {
 
 /// Serialize `entry` and write it atomically to `path` (tempfile + rename).
 fn write_entry(path: &Path, entry: &CachedCollection) -> std::io::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "entry has no parent"))?;
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "entry has no parent")
+    })?;
     fs_err::create_dir_all(dir)?;
     let bytes = serde_json::to_vec(entry)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -225,8 +225,7 @@ fn write_entry(path: &Path, entry: &CachedCollection) -> std::io::Result<()> {
         tmp.write_all(&bytes)?;
         tmp.flush()?;
     }
-    tmp.persist(path)
-        .map_err(|e| e.error)?;
+    tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 

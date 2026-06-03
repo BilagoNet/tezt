@@ -96,7 +96,11 @@ impl Reporter {
                 Outcome::Xpassed => self.style.yellow("XPASS"),
                 Outcome::Error => self.style.red("ERROR"),
             };
-            println!("{tag} {} {}", r.id, self.style.dim(&format!("({:.1}ms)", r.duration_ms)));
+            println!(
+                "{tag} {} {}",
+                r.id,
+                self.style.dim(&format!("({:.1}ms)", r.duration_ms))
+            );
         } else if !self.quiet {
             // Lightweight live progress on stderr (won't pollute stdout).
             let done = self.counts.total();
@@ -211,7 +215,10 @@ impl Reporter {
             self.style.yellow(&line)
         };
         if stopped_early {
-            println!("{line} {}", self.style.yellow("(stopped early: --maxfail reached)"));
+            println!(
+                "{line} {}",
+                self.style.yellow("(stopped early: --maxfail reached)")
+            );
         } else {
             println!("{line}");
         }

@@ -6,28 +6,68 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Git Bash is present on all GitHub runners; using it everywhere means the same
+# `run:` blocks work on Windows (whose default shell is PowerShell).
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  test:
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          # 3.14 is the newest CPython; cover it on Linux (cheapest) where the
+          # asyncio-era runtime changes are most likely to surface.
+          - os: ubuntu-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python ${{ matrix.python }}
+        id: python
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
-      - name: Install pytest (compat tests)
-        run: pip install pytest
-
-      - name: Build
-        run: cargo build --release
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
 
       - name: Worker protocol self-test
-        run: python3 python/test_worker_protocol.py
+        run: python python/test_worker_protocol.py
 
-      - name: Rust tests
-        run: cargo test --release
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+        env:
+          # Windows has no `python3`; hand the tests the exact interpreter
+          # setup-python installed so the worker spawns the right one everywhere.
+          TEZT_TEST_PYTHON: ${{ steps.python.outputs.python-path }}

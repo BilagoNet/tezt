@@ -1,0 +1,11 @@
+# Keep line endings stable across platforms. The Windows CI runner defaults to
+# core.autocrlf=true, which would otherwise check out CRLF files; the collector
+# and worker report source line numbers, so consistent LF endings keep test
+# output identical on every OS.
+* text=auto eol=lf
+*.py text eol=lf
+*.rs text eol=lf
+
+# Binary-ish files we never want munged.
+*.png binary
+*.ico binary

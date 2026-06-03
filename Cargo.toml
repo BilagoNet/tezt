@@ -20,13 +20,25 @@ mimalloc = "0.1"
 num_cpus = "1"
 rayon = "1"
 rustc-hash = "2"
-rustpython-parser = "0.4"
+# Pinned: 0.4.0 is the final release of the standalone parser (upstream now lives
+# in Ruff). It handles match/except*/PEP 695; the one gap is PEP 701 same-quote
+# f-strings, where collection falls back to importing the file. See src/collect.rs.
+rustpython-parser = "=0.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Windows: a Job Object (kill-on-job-close) is how we guarantee no worker — or a
+# subprocess a test spawned — outlives tezt, the equivalent of unix process
+# groups. See the `winjob` module in src/runner.rs.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+] }
 
 [dev-dependencies]
 assert_cmd = "2"

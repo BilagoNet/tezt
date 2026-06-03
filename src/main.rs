@@ -52,7 +52,8 @@ fn run() -> Result<i32> {
     // -k expression
     let kexpr = match &args.keyword {
         Some(expr) => Some(
-            kexpr::KExpr::compile(expr).map_err(|e| anyhow::anyhow!("invalid -k expression: {e}"))?,
+            kexpr::KExpr::compile(expr)
+                .map_err(|e| anyhow::anyhow!("invalid -k expression: {e}"))?,
         ),
         None => None,
     };
@@ -72,17 +73,17 @@ fn run() -> Result<i32> {
 
     let collect_start = Instant::now();
     let collected_files = collect::collect(&paths, &rootdir, cache.as_ref())?;
-    let mut items: Vec<collect::TestItem> = collected_files
-        .into_iter()
-        .flat_map(|f| f.items)
-        .collect();
+    let mut items: Vec<collect::TestItem> =
+        collected_files.into_iter().flat_map(|f| f.items).collect();
 
     // Apply -k: keep an item if its base id or any statically-known case id
     // matches. (Parametrized cases are re-filtered on results below.)
     let mut deselected = 0usize;
     if let Some(k) = &kexpr {
         let before: usize = items.iter().map(|i| i.expected_cases()).sum();
-        items.retain(|item| item.display_ids().iter().any(|id| k.matches(id)) || k.matches(&item.id));
+        items.retain(|item| {
+            item.display_ids().iter().any(|id| k.matches(id)) || k.matches(&item.id)
+        });
         let after: usize = items.iter().map(|i| i.expected_cases()).sum();
         deselected = before.saturating_sub(after);
     }
@@ -95,7 +96,10 @@ fn run() -> Result<i32> {
         if !args.quiet {
             for item in &items {
                 for id in item.display_ids() {
-                    if kexpr.as_ref().map(|k| k.matches(&id) || k.matches(&item.id)).unwrap_or(true)
+                    if kexpr
+                        .as_ref()
+                        .map(|k| k.matches(&id) || k.matches(&item.id))
+                        .unwrap_or(true)
                     {
                         println!("{id}");
                     }
@@ -113,7 +117,11 @@ fn run() -> Result<i32> {
         } else {
             println!("collected {expected_total} tests");
         }
-        return Ok(if expected_total > 0 { EXIT_OK } else { EXIT_NO_TESTS });
+        return Ok(if expected_total > 0 {
+            EXIT_OK
+        } else {
+            EXIT_NO_TESTS
+        });
     }
 
     if expected_total == 0 {
@@ -136,7 +144,10 @@ fn run() -> Result<i32> {
     let jobs = args.jobs.unwrap_or_else(num_cpus::get).max(1);
     let python = python::resolve_python(args.python_override().as_deref(), &rootdir);
     if !args.quiet {
-        println!("{}", style.dim(&format!("python: {}", python::label(&python))));
+        println!(
+            "{}",
+            style.dim(&format!("python: {}", python::label(&python)))
+        );
     }
     let cfg = runner::RunConfig {
         python,
@@ -146,8 +157,12 @@ fn run() -> Result<i32> {
         maxfail: args.effective_maxfail(),
     };
 
-    let mut reporter =
-        report::Reporter::new(args.use_color(), args.verbose > 0, args.quiet, expected_total);
+    let mut reporter = report::Reporter::new(
+        args.use_color(),
+        args.verbose > 0,
+        args.quiet,
+        expected_total,
+    );
     let run_out = runner::run_tests(items, &cfg, |r| {
         // Late -k filter for parametrized case ids unknown at collection.
         if let Some(k) = &kexpr {

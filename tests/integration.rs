@@ -34,14 +34,22 @@ fn suite(name: &str) -> PathBuf {
 /// `pytest_available()` probes — which is exactly `python3` on PATH.
 fn tezt(suite_name: &str) -> Command {
     let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
-    cmd.env("TEZT_PYTHON", "python3");
+    cmd.env("TEZT_PYTHON", test_python());
     cmd.arg("--color").arg("never").arg(suite(suite_name));
     cmd
 }
 
-/// True if `python3 -c "import pytest"` succeeds on this machine.
+/// Interpreter the worker should run under during tests. Defaults to `python3`
+/// (correct on macOS/Linux dev machines). CI sets `TEZT_TEST_PYTHON` to the
+/// exact `setup-python` interpreter — essential on Windows, which has no
+/// `python3` executable, only `python.exe`.
+fn test_python() -> String {
+    std::env::var("TEZT_TEST_PYTHON").unwrap_or_else(|_| "python3".to_string())
+}
+
+/// True if `import pytest` succeeds under the test interpreter.
 fn pytest_available() -> bool {
-    StdCommand::new("python3")
+    StdCommand::new(test_python())
         .args(["-c", "import pytest"])
         .output()
         .map(|o| o.status.success())
@@ -205,15 +213,10 @@ fn json_report_is_valid_and_well_shaped() {
     let json_path = std::env::temp_dir().join("tezt_it_basic_report.json");
     let _ = std::fs::remove_file(&json_path);
 
-    tezt("basic")
-        .arg("--json")
-        .arg(&json_path)
-        .assert()
-        .code(1);
+    tezt("basic").arg("--json").arg(&json_path).assert().code(1);
 
     let raw = std::fs::read_to_string(&json_path).expect("json report file should exist");
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).expect("report should be valid JSON");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("report should be valid JSON");
 
     assert!(
         value.get("summary").map(|s| s.is_object()).unwrap_or(false),
@@ -223,7 +226,10 @@ fn json_report_is_valid_and_well_shaped() {
         .get("tests")
         .and_then(|t| t.as_array())
         .expect("top-level \"tests\" must be a JSON array");
-    assert!(!tests.is_empty(), "\"tests\" array should not be empty for basic suite");
+    assert!(
+        !tests.is_empty(),
+        "\"tests\" array should not be empty for basic suite"
+    );
 
     let _ = std::fs::remove_file(&json_path);
 }

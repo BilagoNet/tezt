@@ -126,8 +126,7 @@ pub fn find_test_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
-                && is_test_file(entry.path())
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && is_test_file(entry.path())
             {
                 files.push(entry.path().to_path_buf());
             }
@@ -164,22 +163,24 @@ fn rel_id(file: &Path, rootdir: &Path) -> String {
 }
 
 fn collect_file(file: &Path, rootdir: &Path, cache: Option<&Cache>) -> Result<CollectedFile> {
-    let abs = fs_err::canonicalize(file)
-        .with_context(|| format!("cannot resolve {}", file.display()))?;
+    let abs =
+        fs_err::canonicalize(file).with_context(|| format!("cannot resolve {}", file.display()))?;
     let rel = rel_id(file, rootdir);
 
     // Freshness key from the file's metadata (size + mtime + tezt version).
     // If we can read it and the cache has a matching entry, reconstruct the
     // result without reading or parsing the source.
-    let key = fs_err::metadata(&abs).ok().map(|m| crate::cache::file_key(&m));
+    let key = fs_err::metadata(&abs)
+        .ok()
+        .map(|m| crate::cache::file_key(&m));
     if let (Some(cache), Some(key)) = (cache, &key) {
         if let Some(hit) = cache.get(&abs, key) {
             return Ok(from_cache(hit, &abs, &rel));
         }
     }
 
-    let source = fs_err::read_to_string(&abs)
-        .with_context(|| format!("cannot read {}", abs.display()))?;
+    let source =
+        fs_err::read_to_string(&abs).with_context(|| format!("cannot read {}", abs.display()))?;
 
     let collected = parse_file(&source, &abs, &rel);
 
@@ -196,9 +197,15 @@ fn parse_file(source: &str, abs: &Path, rel: &str) -> CollectedFile {
     let parsed = ast::Suite::parse(source, rel);
     let body = match parsed {
         Ok(b) => b,
-        Err(_) => {
-            // Unparseable (syntax error or very new syntax): let the Python
-            // worker try at import time.
+        Err(e) => {
+            // Unparseable: a real syntax error, or syntax newer than the parser
+            // understands (e.g. PEP 701 same-quote f-strings). Fall back to
+            // import-time discovery by the worker — still correct, just slower
+            // and without statically-known parametrize ids. Surfaced under
+            // TEZT_DEBUG so the (rare) degradation is observable.
+            if std::env::var_os("TEZT_DEBUG").is_some() {
+                eprintln!("tezt: {rel}: static parse failed ({e}); using import-time discovery");
+            }
             return CollectedFile {
                 items: vec![TestItem {
                     id: rel.to_string(),
@@ -218,12 +225,24 @@ fn parse_file(source: &str, abs: &Path, rel: &str) -> CollectedFile {
         match stmt {
             ast::Stmt::FunctionDef(f) if f.name.as_str().starts_with("test") => {
                 if is_test_name(f.name.as_str()) {
-                    items.push(make_item(rel, abs, f.name.as_str(), None, &f.decorator_list));
+                    items.push(make_item(
+                        rel,
+                        abs,
+                        f.name.as_str(),
+                        None,
+                        &f.decorator_list,
+                    ));
                 }
             }
             ast::Stmt::AsyncFunctionDef(f) => {
                 if is_test_name(f.name.as_str()) {
-                    items.push(make_item(rel, abs, f.name.as_str(), None, &f.decorator_list));
+                    items.push(make_item(
+                        rel,
+                        abs,
+                        f.name.as_str(),
+                        None,
+                        &f.decorator_list,
+                    ));
                 }
             }
             ast::Stmt::ClassDef(c) if c.name.as_str().starts_with("Test") => {
@@ -619,5 +638,69 @@ def test_d(x):
         );
         assert_eq!(c.items[0].param_ids, Some(Vec::new()));
         assert_eq!(c.items[0].expected_cases(), 1);
+    }
+
+    // The collector must keep its fast (static) path on modern Python syntax;
+    // anything it can't parse silently degrades to import-time discovery, so we
+    // pin the boundary with tests. (These assert the *parser's* reach and are
+    // independent of the Python version actually running the tests.)
+
+    #[test]
+    fn collects_match_and_except_star() {
+        // 3.10 `match` and 3.11 `except*` inside test bodies parse statically.
+        let c = collect_src(concat!(
+            "def test_match(v=1):\n",
+            "    match v:\n",
+            "        case 1:\n",
+            "            assert True\n",
+            "        case _:\n",
+            "            assert False\n",
+            "\n",
+            "def test_eg():\n",
+            "    try:\n",
+            "        raise ValueError\n",
+            "    except* ValueError:\n",
+            "        assert True\n",
+        ));
+        assert!(!c.dynamic, "match/except* should parse statically");
+        let ids: Vec<_> = c.items.iter().map(|i| i.qualname.clone()).collect();
+        assert_eq!(ids, vec!["test_match", "test_eg"]);
+    }
+
+    #[test]
+    fn collects_pep695_type_params_and_alias() {
+        // 3.12 PEP 695 type parameters and `type` aliases parse statically.
+        let c = collect_src(concat!(
+            "type IntList = list[int]\n",
+            "\n",
+            "def test_generic[T](x=None):\n",
+            "    assert True\n",
+            "\n",
+            "class TestBox[T]:\n",
+            "    def test_inner(self):\n",
+            "        assert True\n",
+        ));
+        assert!(!c.dynamic, "PEP 695 syntax should parse statically");
+        let ids: Vec<_> = c.items.iter().map(|i| i.qualname.clone()).collect();
+        assert!(ids.contains(&"test_generic".to_string()), "got {ids:?}");
+        assert!(
+            ids.contains(&"TestBox::test_inner".to_string()),
+            "got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn pep701_fstring_falls_back_gracefully() {
+        // The lone modern-syntax gap in rustpython-parser 0.4 is PEP 701
+        // same-quote nested f-strings. tezt must still collect the file (via
+        // import-time discovery), never crash. Whether it parses statically or
+        // falls back, the file stays collectable — that's the invariant.
+        let c = collect_src("def test_fstr():\n    assert f\"{\"x\"}\" == \"x\"\n");
+        if c.dynamic {
+            assert_eq!(c.items.len(), 1);
+            assert_eq!(c.items[0].qualname, "*");
+        } else {
+            assert!(c.items.iter().any(|i| i.qualname == "test_fstr"));
+        }
     }
 }
