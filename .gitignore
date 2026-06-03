@@ -1,0 +1,18 @@
+# Rust
+/target
+*.profraw
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Benchmarks
+bench/.suites/
+bench/results.json
+
+# Misc
+.DS_Store
+/outputs

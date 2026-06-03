@@ -1,0 +1,88 @@
+# Temporary bootstrap workflow: builds tezt on an arm64 runner and publishes
+# the compile/test logs plus the binary to the `ci-out` branch so they can be
+# consumed over the git protocol. Removed once development stabilizes.
+name: bootstrap
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bootstrap
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test deps
+        run: pip install pytest pytest-xdist
+
+      - name: Build (release)
+        id: build
+        run: |
+          status=0
+          cargo build --release 2>&1 | tee build.log || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Worker protocol self-test
+        id: selftest
+        run: |
+          status=0
+          python3 python/test_worker_protocol.py 2>&1 | tee selftest.log || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Unit + integration tests
+        id: test
+        if: steps.build.outputs.status == '0'
+        run: |
+          status=0
+          cargo test --release 2>&1 | tee test.log || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke benchmark (small suite)
+        id: bench
+        if: steps.test.outputs.status == '0'
+        run: |
+          status=0
+          python3 bench/gen_suite.py --out /tmp/suite_ci --files 20 --tests-per-file 25 --style trivial --flavor plain 2>&1 | tee bench.log || status=$?
+          python3 bench/run_bench.py --tezt-bin target/release/tezt --suite /tmp/suite_ci --runs 3 --jobs 4 --label ci-small --out bench-results.json 2>&1 | tee -a bench.log || status=$?
+          echo "bench exit: $status" >> bench.log
+
+      - name: Publish logs + binary to ci-out branch
+        if: always()
+        run: |
+          mkdir -p /tmp/out
+          echo "sha: $GITHUB_SHA" > /tmp/out/META.txt
+          echo "build_status: ${{ steps.build.outputs.status }}" >> /tmp/out/META.txt
+          echo "selftest_status: ${{ steps.selftest.outputs.status }}" >> /tmp/out/META.txt
+          echo "test_status: ${{ steps.test.outputs.status }}" >> /tmp/out/META.txt
+          cp -f build.log /tmp/out/ 2>/dev/null || true
+          cp -f selftest.log /tmp/out/ 2>/dev/null || true
+          cp -f test.log /tmp/out/ 2>/dev/null || true
+          cp -f bench.log /tmp/out/ 2>/dev/null || true
+          cp -f bench/RESULTS.md /tmp/out/BENCH_RESULTS.md 2>/dev/null || true
+          cp -f Cargo.lock /tmp/out/ 2>/dev/null || true
+          cp -f target/release/tezt /tmp/out/tezt-aarch64 2>/dev/null || true
+          cd /tmp/out
+          git init -q -b ci-out
+          git config user.email "ci@tezt.invalid"
+          git config user.name "tezt-ci"
+          git add -A
+          git commit -qm "ci results for $GITHUB_SHA"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-out:ci-out
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

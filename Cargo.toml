@@ -1,0 +1,31 @@
+[package]
+name = "tezt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "An extremely fast Python test runner, written in Rust."
+license = "MIT"
+repository = "https://github.com/BilagoNet/tezt"
+keywords = ["python", "testing", "test-runner", "pytest"]
+categories = ["development-tools::testing", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+ignore = "0.4"
+num_cpus = "1"
+rayon = "1"
+rustpython-parser = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
