@@ -5,14 +5,14 @@
 use crate::collect::TestItem;
 use anyhow::{Context, Result};
 use crossbeam_channel as channel;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The embedded Python worker, shipped inside the tezt binary.
 pub const WORKER_SOURCE: &str = include_str!("../python/tezt_worker.py");
@@ -52,6 +52,35 @@ fn register_worker(pgid: i32) {
 fn unregister_worker(pgid: i32) {
     if let Some(set) = LIVE_WORKERS.lock().unwrap().as_mut() {
         set.remove(&pgid);
+    }
+}
+
+/// Force-kill a worker by pid/pgid. Used by the timeout watchdog, which doesn't
+/// own the `Worker`/`Child` and so can't call `force_kill_group`. On unix this
+/// signals the whole process group, so a hung test's own subprocesses die too;
+/// on Windows it terminates the worker process (its descendants are reaped when
+/// the shared Job Object closes).
+#[cfg(unix)]
+fn force_kill_pid(pgid: i32) {
+    // SAFETY: best-effort SIGKILL to a process group we created with
+    // `process_group(0)`; harmless if the group is already gone.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn force_kill_pid(pid: i32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    // SAFETY: open the worker by pid for termination, terminate it, close the
+    // handle. All best-effort: a null handle (already exited) is skipped.
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if !handle.is_null() {
+            let _ = TerminateProcess(handle, 1);
+            let _ = CloseHandle(handle);
+        }
     }
 }
 
@@ -513,6 +542,9 @@ pub struct RunConfig {
     pub jobs: usize,
     pub no_capture: bool,
     pub maxfail: Option<usize>,
+    /// Per-test wall-clock budget. When set, a watchdog kills any worker that
+    /// produces no event within this long and the test is reported as an error.
+    pub timeout: Option<Duration>,
 }
 
 pub struct RunOutput {
@@ -565,6 +597,51 @@ where
     let bad_count = Arc::new(AtomicUsize::new(0));
     let maxfail = cfg.maxfail;
 
+    // --- per-test timeout watchdog (opt-in) ---------------------------------
+    // With --timeout set, a watchdog thread kills any worker that produces no
+    // event within the budget; that worker's thread then sees EOF and reports
+    // its in-flight items as timed-out errors. With no timeout the watchdog is
+    // never spawned and the execution hot path is unchanged.
+    let timeout = cfg.timeout;
+    let activity: Option<Arc<Mutex<FxHashMap<i32, Instant>>>> =
+        timeout.map(|_| Arc::new(Mutex::new(FxHashMap::default())));
+    let timed_out: Arc<Mutex<FxHashSet<i32>>> = Arc::new(Mutex::new(FxHashSet::default()));
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog: Option<std::thread::JoinHandle<()>> = match (timeout, &activity) {
+        (Some(budget), Some(act)) => {
+            let activity = Arc::clone(act);
+            let timed_out = Arc::clone(&timed_out);
+            let watchdog_done = Arc::clone(&watchdog_done);
+            // Poll a few times per budget, bounded so we neither miss the
+            // deadline by much nor spin.
+            let tick = budget
+                .checked_div(4)
+                .unwrap_or(budget)
+                .clamp(Duration::from_millis(20), Duration::from_millis(250));
+            Some(std::thread::spawn(move || {
+                while !watchdog_done.load(Ordering::SeqCst) {
+                    std::thread::sleep(tick);
+                    let now = Instant::now();
+                    let stale: Vec<i32> = {
+                        let map = activity.lock().unwrap();
+                        map.iter()
+                            .filter(|(_, &last)| now.duration_since(last) > budget)
+                            .map(|(&pgid, _)| pgid)
+                            .collect()
+                    };
+                    for pgid in stale {
+                        timed_out.lock().unwrap().insert(pgid);
+                        force_kill_pid(pgid);
+                        // Drop it so we don't kill twice; the worker thread will
+                        // see EOF and report the test as timed out.
+                        activity.lock().unwrap().remove(&pgid);
+                    }
+                }
+            }))
+        }
+        _ => None,
+    };
+
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let batch_rx = batch_rx.clone();
@@ -575,6 +652,8 @@ where
         let shim = shim.clone();
         let rootdir = cfg.rootdir.clone();
         let no_capture = cfg.no_capture;
+        let activity = activity.clone();
+        let timed_out = Arc::clone(&timed_out);
 
         handles.push(std::thread::spawn(move || -> Result<()> {
             let mut worker: Option<Worker> = None;
@@ -586,6 +665,12 @@ where
                     worker = Some(Worker::spawn(&python, &shim, &rootdir, no_capture)?);
                 }
                 let w = worker.as_mut().unwrap();
+                let pgid = w.pgid;
+                // Mark this worker active so the watchdog measures the new test
+                // from now (also covers the first test's module import).
+                if let Some(act) = &activity {
+                    act.lock().unwrap().insert(pgid, Instant::now());
+                }
 
                 let wire_items: Vec<WireItem> = batch
                     .items
@@ -604,7 +689,14 @@ where
                 let mut seen: FxHashSet<String> = FxHashSet::default();
                 let mut worker_died = false;
                 loop {
-                    match w.read_event()? {
+                    let ev = w.read_event()?;
+                    // Any event = the worker made progress; reset its deadline.
+                    if ev.is_some() {
+                        if let Some(act) = &activity {
+                            act.lock().unwrap().insert(pgid, Instant::now());
+                        }
+                    }
+                    match ev {
                         Some(WireEvent::Result {
                             id,
                             outcome,
@@ -650,13 +742,24 @@ where
                         }
                         Some(_) => continue,
                         None => {
-                            report_missing(
-                                &batch,
-                                &seen,
-                                &res_tx,
-                                "worker process exited unexpectedly",
-                                None,
-                            );
+                            // EOF: the worker exited, crashed, or was killed by
+                            // the timeout watchdog. Name the timeout case so the
+                            // failure is self-explanatory; either way the batch's
+                            // unfinished items are reported as errors.
+                            let msg = if timed_out.lock().unwrap().contains(&pgid) {
+                                match timeout {
+                                    Some(b) => {
+                                        format!(
+                                            "test timed out after {:.0}s; worker killed",
+                                            b.as_secs_f64()
+                                        )
+                                    }
+                                    None => "test timed out; worker killed".to_string(),
+                                }
+                            } else {
+                                "worker process exited unexpectedly".to_string()
+                            };
+                            report_missing(&batch, &seen, &res_tx, &msg, None);
                             worker_died = true;
                             break;
                         }
@@ -666,12 +769,20 @@ where
                     if let Some(w) = worker.take() {
                         w.kill();
                     }
+                    if let Some(act) = &activity {
+                        act.lock().unwrap().remove(&pgid);
+                    }
                 }
                 if should_stop(&stop) {
                     break;
                 }
             }
             if let Some(w) = worker.take() {
+                // Take this worker off the watchdog's radar before its graceful
+                // shutdown, which legitimately takes a moment.
+                if let Some(act) = &activity {
+                    act.lock().unwrap().remove(&w.pgid);
+                }
                 if should_stop(&stop) {
                     w.kill();
                 } else {
@@ -709,6 +820,11 @@ where
             Ok(Err(e)) => eprintln!("tezt: worker thread error: {e}"),
             Err(_) => eprintln!("tezt: worker thread panicked"),
         }
+    }
+    // All workers are done; stop and reap the watchdog.
+    watchdog_done.store(true, Ordering::SeqCst);
+    if let Some(handle) = watchdog {
+        let _ = handle.join();
     }
     let _ = std::fs::remove_file(&shim);
 

@@ -155,6 +155,7 @@ fn run() -> Result<i32> {
         jobs,
         no_capture: args.no_capture,
         maxfail: args.effective_maxfail(),
+        timeout: args.timeout.map(std::time::Duration::from_secs_f64),
     };
 
     let mut reporter = report::Reporter::new(

@@ -57,6 +57,11 @@ pub struct Cli {
     #[arg(long = "durations", value_name = "N")]
     pub durations: Option<usize>,
 
+    /// Kill a test (and report it as an error) if it runs longer than this many
+    /// seconds. Applies per test; off by default.
+    #[arg(long = "timeout", value_name = "SECONDS")]
+    pub timeout: Option<f64>,
+
     /// Control colored output
     #[arg(long = "color", value_name = "WHEN", default_value = "auto",
           value_parser = ["auto", "always", "never"])]

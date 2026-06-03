@@ -166,6 +166,7 @@ free.
 | `-s` / `--no-capture` | Don't capture test stdout/stderr |
 | `--collect-only` | List the tests that would run, then exit |
 | `--durations N` | Print the N slowest tests |
+| `--timeout SECONDS` | Kill and report any test that runs longer than this (off by default) |
 | `--json PATH` | Write a machine-readable JSON report |
 | `--python EXE` | Interpreter for the workers (also `$TEZT_PYTHON`); accepts a path or an `X.Y` version |
 | `--no-cache` / `--clear-cache` | Skip / delete the collection cache for this run |
@@ -232,7 +233,6 @@ spawned.
 Roughly in the order it's likely to happen:
 
 - [ ] Prebuilt binaries + `pip` / `uv tool` distribution
-- [ ] Per-test timeouts for hung tests
 - [ ] Rich assertion diffs (operator-aware), beyond source line + locals
 - [ ] Mark expressions (`-m`)
 - [ ] Class-scoped and async fixtures

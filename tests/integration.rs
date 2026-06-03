@@ -307,3 +307,34 @@ fn pytest_compat_collects_17_tests() {
         .code(0)
         .stdout(predicate::str::contains("collected 17 tests"));
 }
+
+// ---------------------------------------------------------------------------
+// --timeout: a hung test is killed and reported, and the run doesn't hang
+// ---------------------------------------------------------------------------
+
+#[test]
+fn timeout_kills_a_hung_test() {
+    // A test that would otherwise block for 30s is killed at the 2s budget. The
+    // run finishes promptly (well under the 30s sleep), reports the test as a
+    // timeout error, and exits 1. This also exercises the cross-platform kill
+    // path — process group on unix, TerminateProcess on Windows — in CI.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_hang.py"),
+        "import time\n\n\ndef test_sleeps_forever():\n    time.sleep(30)\n",
+    )
+    .expect("write hung test");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--no-cache")
+        .arg("--timeout")
+        .arg("2")
+        .arg(dir.path());
+
+    cmd.assert()
+        .code(1)
+        .stdout(predicate::str::contains("timed out"));
+}
