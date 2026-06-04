@@ -1,5 +1,10 @@
 <div align="center">
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <img alt="tezt" src="assets/logo.svg" width="128" height="128">
+</picture>
+
 # tezt
 
 **An extremely fast Python test runner, written in Rust.**
