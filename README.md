@@ -259,7 +259,6 @@ spawned.
 
 Roughly in the order it's likely to happen:
 
-- [ ] Prebuilt binaries + `pip` / `uv tool` distribution
 - [ ] Rich assertion diffs (operator-aware), beyond source line + locals
 - [ ] Mark expressions (`-m`)
 - [ ] Class-scoped and async fixtures
