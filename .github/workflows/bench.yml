@@ -74,7 +74,7 @@ jobs:
             --tezt-bin "${{ steps.bin.outputs.path }}" \
             --suite suite_bench \
             --label "${{ matrix.os }}-py${{ matrix.python }}" \
-            --runs 5 --jobs 4 \
+            --runs 5 --jobs 4 --skip-cold \
             --out out/result.json
           cp out/result.json "out/${{ matrix.os }}__py${{ matrix.python }}.json"
       - uses: actions/upload-artifact@v4
