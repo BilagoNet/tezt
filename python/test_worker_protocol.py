@@ -7,6 +7,7 @@ Stdlib only. Run: python3 python/test_worker_protocol.py  (exit 0 = green).
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,10 +37,12 @@ def check(cond, label, extra=""):
 # ============================================================================
 
 class Worker:
-    def __init__(self, rootdir, no_capture=False):
+    def __init__(self, rootdir, no_capture=False, tb=None):
         cmd = [sys.executable, "-u", WORKER, "--rootdir", rootdir]
         if no_capture:
             cmd.append("--no-capture")
+        if tb is not None:
+            cmd += ["--tb", tb]
         self.proc = subprocess.Popen(
             cmd, cwd=rootdir,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1284,7 +1287,205 @@ def test_pytest_conveniences(root):
 
 
 # ============================================================================
-# Suite 9: performance -- 2000 trivial tests through one worker
+# Suite 9: autouse fixtures, parametrized fixtures + richer request,
+#          --tb traceback styles, --list-fixtures one-shot mode
+# ============================================================================
+
+def test_autouse_param_tb_fixtures(root):
+    print("\n[autouse / param fixtures / request / --tb / --list-fixtures]")
+    write_suite(root, {
+        "conftest.py": """
+            import tezt
+
+            @tezt.fixture
+            def conf_fix():
+                '''A fixture defined in the root conftest.'''
+                return "from-conftest"
+        """,
+        "test_au.py": """
+            import tezt
+
+            AUTO_LOG = []
+
+            @tezt.fixture(autouse=True)
+            def _auto():
+                # Not requested by any test; sets an observable side effect.
+                AUTO_LOG.append("ran")
+
+            @tezt.fixture(scope="module", autouse=True)
+            def _mod_auto():
+                AUTO_LOG.append("mod")
+
+            def test_autouse_seen():
+                # Neither autouse fixture is requested, yet both ran. Higher
+                # scope first: module autouse ("mod") before function ("ran").
+                assert AUTO_LOG == ["mod", "ran"], AUTO_LOG
+
+            def test_autouse_again():
+                # function autouse re-runs; module autouse cached (runs once).
+                assert AUTO_LOG.count("mod") == 1
+                assert AUTO_LOG.count("ran") == 2
+        """,
+        "test_pf.py": """
+            import tezt
+
+            @tezt.fixture(params=[1, 2, 3])
+            def n(request):
+                return request.param
+
+            def test_n(n):
+                assert n in (1, 2, 3)
+
+            @tezt.fixture(params=["a", "b"])
+            def letter(request):
+                return request.param
+
+            @tezt.parametrize("k", [10, 20])
+            def test_combo(letter, k):
+                assert letter in ("a", "b") and k in (10, 20)
+
+            @tezt.fixture
+            def other():
+                return 99
+
+            def test_getfixturevalue(request):
+                assert request.getfixturevalue("other") == 99
+                assert request.node.nodeid is not None
+                assert request.config is not None
+        """,
+        "test_tb.py": """
+            def deep():
+                raise ValueError("kaboom")
+
+            def test_boom():
+                deep()
+        """,
+    })
+
+    # ---- (1) autouse fixtures --------------------------------------------
+    w = Worker(root)
+    fau = os.path.join(root, "test_au.py")
+    results, _ = w.run([
+        {"id": "au::test_autouse_seen", "file": fau, "qualname": "test_autouse_seen"},
+        {"id": "au::test_autouse_again", "file": fau, "qualname": "test_autouse_again"},
+    ])
+    r = by_id(results)
+    check(r["au::test_autouse_seen"]["outcome"] == "passed",
+          "autouse fixtures run unrequested, higher scope first (module<function)",
+          repr(r["au::test_autouse_seen"].get("message")))
+    check(r["au::test_autouse_again"]["outcome"] == "passed",
+          "module autouse cached (runs once), function autouse re-runs",
+          repr(r["au::test_autouse_again"].get("message")))
+
+    # ---- (2) parametrized fixture: 1 item -> 3 results -------------------
+    fpf = os.path.join(root, "test_pf.py")
+    results, _ = w.run([{"id": "pf::test_n", "file": fpf, "qualname": "test_n"}])
+    r = by_id(results)
+    for pid in ("1", "2", "3"):
+        check(r.get("pf::test_n[%s]" % pid, {}).get("outcome") == "passed",
+              "parametrized fixture case [%s]" % pid)
+    check(len([k for k in r if k.startswith("pf::test_n[")]) == 3,
+          "parametrized fixture expands one item into THREE results",
+          repr(sorted(r)))
+
+    # ---- (3) parametrized fixture x @parametrize cartesian ---------------
+    results, _ = w.run([{"id": "pf::test_combo", "file": fpf,
+                         "qualname": "test_combo"}])
+    combo_ids = sorted(x["id"] for x in results)
+    check(len(combo_ids) == 4,
+          "param fixture x @parametrize -> 4-case cartesian product",
+          repr(combo_ids))
+    check(all(x["outcome"] == "passed" for x in results),
+          "all cartesian cases pass")
+
+    # ---- (4) request.getfixturevalue + request surface -------------------
+    results, _ = w.run([{"id": "pf::test_getfixturevalue", "file": fpf,
+                         "qualname": "test_getfixturevalue"}])
+    r = by_id(results)
+    check(r["pf::test_getfixturevalue"]["outcome"] == "passed",
+          "request.getfixturevalue + request.node/config",
+          repr(r["pf::test_getfixturevalue"].get("message")))
+
+    ev, rc = w.shutdown()
+    check(ev.get("event") == "bye" and rc == 0, "autouse/param worker shutdown")
+
+    # ---- (5) --tb styles (spawn workers directly with --tb) --------------
+    ftb = os.path.join(root, "test_tb.py")
+    item = {"id": "tb::test_boom", "file": ftb, "qualname": "test_boom"}
+
+    # default (auto): multi-line traceback.
+    w = Worker(root)
+    results, _ = w.run([item])
+    tb_auto = by_id(results)["tb::test_boom"]["traceback"]
+    w.shutdown()
+    check(tb_auto is not None and "\n" in tb_auto and "ValueError" in tb_auto,
+          "--tb default gives a multi-line traceback", repr(tb_auto))
+
+    # line: a single line "<path>:<lineno>: <ExcType>: <msg>".
+    w = Worker(root, tb="line")
+    results, _ = w.run([item])
+    tb_line = by_id(results)["tb::test_boom"]["traceback"]
+    w.shutdown()
+    check(tb_line is not None and "\n" not in tb_line
+          and tb_line.endswith("ValueError: kaboom")
+          and ".py:" in tb_line,
+          "--tb line gives a single path:line: Exc: msg line", repr(tb_line))
+
+    # no: traceback is None, message preserved.
+    w = Worker(root, tb="no")
+    results, _ = w.run([item])
+    res_no = by_id(results)["tb::test_boom"]
+    w.shutdown()
+    check(res_no["traceback"] is None,
+          "--tb no suppresses the traceback (None)", repr(res_no["traceback"]))
+    check(res_no["message"] and "kaboom" in res_no["message"],
+          "--tb no keeps the failure message", repr(res_no.get("message")))
+
+    # short: location lines + final exception, no source-echo lines.
+    w = Worker(root, tb="short")
+    results, _ = w.run([item])
+    tb_short = by_id(results)["tb::test_boom"]["traceback"]
+    w.shutdown()
+    check(tb_short is not None and "\n" in tb_short
+          and "ValueError: kaboom" in tb_short
+          and 'raise ValueError' not in tb_short,
+          "--tb short keeps frame locations, drops source echo", repr(tb_short))
+
+    # ---- (6) --list-fixtures one-shot mode -------------------------------
+    # Spawn directly with the exact contract: --list-fixtures --rootdir <dir> <paths>.
+    cmd = [sys.executable, "-u", WORKER, "--list-fixtures",
+           "--rootdir", root, root]
+    proc = subprocess.Popen(cmd, cwd=root, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1)
+    out_line = proc.stdout.readline()
+    proc.wait(timeout=15)
+    ev = json.loads(out_line)
+    check(ev.get("event") == "fixtures" and proc.returncode == 0,
+          "--list-fixtures emits a single 'fixtures' event, exit 0", repr(ev.get("event")))
+    fixtures = ev.get("fixtures", [])
+    by_name = {fx["name"]: fx for fx in fixtures}
+    check("conf_fix" in by_name and by_name["conf_fix"]["scope"] == "function"
+          and re.search(r"conftest\.py:\d+$", by_name["conf_fix"]["location"]),
+          "--list-fixtures lists the conftest fixture with file:line location",
+          repr(by_name.get("conf_fix")))
+    check(by_name.get("conf_fix", {}).get("doc") == "A fixture defined in the root conftest.",
+          "--list-fixtures reports the fixture's docstring first line",
+          repr(by_name.get("conf_fix", {}).get("doc")))
+    check("tmp_path" in by_name and by_name["tmp_path"]["scope"] == "function"
+          and by_name["tmp_path"]["location"] == "builtin",
+          "--list-fixtures includes builtin tmp_path (function, builtin)",
+          repr(by_name.get("tmp_path")))
+    check("capsys" in by_name and "tmp_path_factory" in by_name
+          and by_name["tmp_path_factory"]["scope"] == "session",
+          "--list-fixtures includes capsys + session-scoped tmp_path_factory",
+          repr([by_name.get("capsys"), by_name.get("tmp_path_factory")]))
+    check([fx["name"] for fx in fixtures] == sorted(fx["name"] for fx in fixtures),
+          "--list-fixtures output is sorted by name")
+
+
+# ============================================================================
+# Suite 10: performance -- 2000 trivial tests through one worker
 # ============================================================================
 
 def test_perf(root):
@@ -1328,7 +1529,8 @@ def test_perf(root):
 def main():
     suites = [test_core, test_fixtures, test_classes_async_discovery,
               test_pytest_compat, test_misc, test_class_async_assert,
-              test_hooks_and_coverage, test_pytest_conveniences]
+              test_hooks_and_coverage, test_pytest_conveniences,
+              test_autouse_param_tb_fixtures]
     per_test_ms = None
     for fn in suites:
         root = tempfile.mkdtemp(prefix="tezt-selftest-")

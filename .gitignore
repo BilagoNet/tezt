@@ -19,3 +19,9 @@ bench/results.json
 
 # tezt collection cache
 .tezt_cache/
+
+# Coverage artifacts (from `tezt --cov`)
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

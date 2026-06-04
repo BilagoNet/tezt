@@ -44,6 +44,17 @@ flags can still change between versions.
   no path is given), and `markers`.
 - **JUnit XML** — `--junitxml PATH` writes a `<testsuites>` report that CI test
   reporters (GitHub, GitLab, Jenkins) understand.
+- **Autouse and parametrized fixtures** — `@fixture(autouse=True)` runs for every
+  test in scope without being requested; `@fixture(params=[...])` expands a test
+  into one case per value, with `request.param` inside the fixture. `request`
+  grew up too: `.param`, `.config`, `.node`, `.getfixturevalue(name)`,
+  `.addfinalizer(fn)`.
+- **`--tb` styles** — `auto` (default), `long`, `short`, `line`, `no` control how
+  much traceback a failure prints.
+- **`--stepwise` / `--sw`** — stop at the first failure and resume from it on the
+  next run (sequential, fail-fast); the resume point lives in `.tezt_cache`.
+- **`--fixtures` and `--markers`** — list the fixtures available to a path (with
+  scope, location, and docstring) or the built-in + registered markers, then exit.
 
 ## 0.1.0 — 2026-06-04
 

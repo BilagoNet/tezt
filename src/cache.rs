@@ -40,6 +40,12 @@ const COLLECT_VERSION: &str = "collect-v2";
 /// `--lf`/`--ff`. Its own `-v1` suffix is the kill switch for its shape.
 const LASTFAILED_FILE: &str = "lastfailed-v1.json";
 
+/// File (under `.tezt_cache`) holding the stepwise resume point: the id of the
+/// test to resume from on the next `--stepwise` run. Like the last-failed
+/// record it is a single tiny JSON object at the cache root, independent of the
+/// collection cache, with its own `-v1` shape kill switch.
+const STEPWISE_FILE: &str = "stepwise-v1.json";
+
 /// Standard cache-directory tag content (see <https://bford.info/cachedir/>).
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
 # This file is a cache directory tag created by tezt.\n\
@@ -308,6 +314,81 @@ fn write_last_failed(path: &Path, ids: &[&String]) -> std::io::Result<()> {
     Ok(())
 }
 
+// --- stepwise resume state --------------------------------------------------
+//
+// `--stepwise` stops at the first failure and resumes from that test on the
+// next run. That resume point is a single test id persisted between runs,
+// deliberately kept separate from the last-failed record (different lifecycle:
+// it is the *first* failure of a stepwise run, set/cleared by `--stepwise`
+// only, not the merged failure set). Stored as a tiny JSON object so the field
+// is self-describing and the file can grow more state later without a reshape:
+// `{"last_failed": "<id>"}` when paused at a failure, `{}` when the suite is
+// clean. Best-effort throughout — a damaged or missing file means "no resume
+// point", never an error.
+
+/// On-disk shape of the stepwise file. The single field is optional so the
+/// "clean suite" state serializes to `{}` (via `skip_serializing_if`) and an
+/// absent field deserializes to `None`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StepwiseState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_failed: Option<String>,
+}
+
+/// Absolute path of the stepwise resume file under `<rootdir>/.tezt_cache`.
+fn stepwise_path(rootdir: &Path) -> PathBuf {
+    rootdir.join(".tezt_cache").join(STEPWISE_FILE)
+}
+
+/// Load the stepwise resume point: the test id to resume from, or `None` when
+/// there is no record, the file is empty/clean (`{}`), or it is unreadable or
+/// corrupt. A damaged record must never break `--stepwise`; it just degrades to
+/// "resume from the start".
+pub fn load_stepwise(rootdir: &Path) -> Option<String> {
+    let path = stepwise_path(rootdir);
+    let bytes = fs_err::read(&path).ok()?;
+    let state: StepwiseState = serde_json::from_slice(&bytes).ok()?;
+    state.last_failed
+}
+
+/// Persist the stepwise resume point, best-effort (errors are ignored; the
+/// cache must never fail a run). `Some(id)` writes `{"last_failed": "<id>"}`;
+/// `None` writes `{}` to clear the resume point (the suite is clean again).
+///
+/// Writes atomically (tempfile + rename), creating `.tezt_cache` with its
+/// marker files via [`init_cache_dir`] if needed — the same pattern as
+/// [`save_last_failed`], so a crash never leaves a half-written record.
+pub fn save_stepwise(rootdir: &Path, id: Option<&str>) {
+    let cache_dir = rootdir.join(".tezt_cache");
+    if init_cache_dir(&cache_dir).is_err() {
+        return;
+    }
+    let state = StepwiseState {
+        last_failed: id.map(str::to_owned),
+    };
+    let _ = write_stepwise(&cache_dir.join(STEPWISE_FILE), &state);
+}
+
+/// Serialize the stepwise state and write it atomically (same tempfile +
+/// rename pattern as [`write_last_failed`]). Reports IO/serialization errors to
+/// the caller, which ignores them.
+fn write_stepwise(path: &Path, state: &StepwiseState) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "record has no parent")
+    })?;
+    fs_err::create_dir_all(dir)?;
+    let bytes = serde_json::to_vec(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    {
+        use std::io::Write as _;
+        tmp.write_all(&bytes)?;
+        tmp.flush()?;
+    }
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +625,46 @@ mod tests {
                 .collect();
         save_last_failed(dir.path(), &second);
         assert_eq!(load_last_failed(dir.path()), second);
+    }
+
+    #[test]
+    fn stepwise_round_trip_save_clear_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing record => no resume point.
+        assert_eq!(load_stepwise(dir.path()), None);
+
+        // Save an id, read it back.
+        save_stepwise(dir.path(), Some("test_a.py::test_one"));
+        assert_eq!(
+            load_stepwise(dir.path()),
+            Some("test_a.py::test_one".to_string())
+        );
+        // The record lives at the cache root, beside CACHEDIR.TAG.
+        assert!(dir.path().join(".tezt_cache").join(STEPWISE_FILE).exists());
+
+        // Overwrite with a different id.
+        save_stepwise(dir.path(), Some("test_a.py::test_two[1]"));
+        assert_eq!(
+            load_stepwise(dir.path()),
+            Some("test_a.py::test_two[1]".to_string())
+        );
+
+        // Clearing (None) writes `{}` and loads back as None, but keeps the file.
+        save_stepwise(dir.path(), None);
+        assert_eq!(load_stepwise(dir.path()), None);
+        let body =
+            std::fs::read_to_string(dir.path().join(".tezt_cache").join(STEPWISE_FILE)).unwrap();
+        assert_eq!(body, "{}");
+    }
+
+    #[test]
+    fn stepwise_corrupt_record_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join(".tezt_cache");
+        fs_err::create_dir_all(&cache_dir).unwrap();
+        fs_err::write(cache_dir.join(STEPWISE_FILE), b"not json").unwrap();
+        // A damaged record degrades to "no resume point" rather than erroring.
+        assert_eq!(load_stepwise(dir.path()), None);
     }
 }

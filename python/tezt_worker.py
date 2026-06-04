@@ -37,6 +37,7 @@ import warnings
 
 CAPTURE_LIMIT = 64 * 1024          # truncate captured stdout/stderr fields
 TRACEBACK_LINES = 50               # keep last N lines of tracebacks
+TB_STYLE = "auto"                  # --tb: auto|long|short|line|no (set in main())
 DEBUG = os.environ.get("TEZT_DEBUG") == "1"
 
 _REAL_STDOUT = None                # protocol channel (saved before any capture)
@@ -142,12 +143,21 @@ class _MarkNamespace:
 
 
 class FixtureDef:
-    """Metadata wrapper a @tezt.fixture decoration produces (callable passthrough)."""
+    """Metadata wrapper a @tezt.fixture decoration produces (callable passthrough).
 
-    def __init__(self, func, scope, name):
+    `params` (optional) parametrizes the fixture: one test case per value, with
+    `request.param` set to that value inside the fixture body. `ids` overrides
+    the per-value id fragments (parallel to `params`). `autouse=True` makes the
+    fixture run for every test in its scope without being requested by name.
+    """
+
+    def __init__(self, func, scope, name, autouse=False, params=None, ids=None):
         self.func = func
         self.scope = scope
         self.name = name or func.__name__
+        self.autouse = autouse
+        self.params = list(params) if params is not None else None
+        self.ids = list(ids) if ids is not None else None
         self._tezt_fixture = True
 
     def __call__(self, *args, **kwargs):  # allow direct invocation in user code
@@ -158,14 +168,15 @@ def _make_tezt_module():
     mod = types.ModuleType("tezt")
     mod.__doc__ = "Virtual tezt module injected by tezt_worker."
 
-    def fixture(func=None, *, scope="function", name=None):
+    def fixture(func=None, *, scope="function", name=None, autouse=False,
+                params=None, ids=None):
         if scope not in ("function", "module", "session", "class"):
             raise ValueError("invalid fixture scope: %r" % scope)
         if func is not None:
-            return FixtureDef(func, scope, name)
+            return FixtureDef(func, scope, name, autouse, params, ids)
 
         def deco(f):
-            return FixtureDef(f, scope, name)
+            return FixtureDef(f, scope, name, autouse, params, ids)
         return deco
 
     def parametrize(argnames, argvalues, ids=None):
@@ -648,22 +659,40 @@ class HookItem:
 # Fixture discovery -- recognize both tezt FixtureDef and pytest fixtures.
 # ============================================================================
 
-def _as_fixture(obj):
-    """If obj is a fixture definition (tezt or pytest), return (func, scope, name).
+# What _as_fixture returns and what fixture lookup tables store. Carrying
+# autouse/params/ids on a namedtuple keeps every unpack site readable and lets
+# new fields be added without reshuffling positional tuples everywhere.
+FixtureInfo = collections.namedtuple(
+    "FixtureInfo", ["func", "scope", "name", "autouse", "params", "ids"])
+LookupEntry = collections.namedtuple(
+    "LookupEntry", ["func", "scope", "module", "autouse", "params", "ids"])
 
-    Returns None for non-fixtures. Never imports pytest itself.
+
+def _as_fixture(obj):
+    """If obj is a fixture definition (tezt or pytest), return a FixtureInfo.
+
+    Returns None for non-fixtures. Never imports pytest itself. autouse/params/
+    ids are read off the marker for pytest fixtures (defaulting False/None).
     """
     # tezt fixture
     if isinstance(obj, FixtureDef):
-        return obj.func, obj.scope, obj.name
+        return FixtureInfo(obj.func, obj.scope, obj.name,
+                           obj.autouse, obj.params, obj.ids)
     # pytest >= 8.4: FixtureFunctionDefinition object wrapping the function
     if type(obj).__name__ == "FixtureFunctionDefinition":
         func = getattr(obj, "_fixture_function", None)
         marker = getattr(obj, "_fixture_function_marker", None)
         scope = getattr(marker, "scope", "function") if marker else "function"
         name = getattr(marker, "name", None) if marker else None
+        autouse = bool(getattr(marker, "autouse", False)) if marker else False
+        params = getattr(marker, "params", None) if marker else None
+        ids = getattr(marker, "ids", None) if marker else None
         if func is not None:
-            return func, _norm_scope(scope), name or getattr(func, "__name__", None)
+            return FixtureInfo(func, _norm_scope(scope),
+                               name or getattr(func, "__name__", None),
+                               autouse,
+                               list(params) if params is not None else None,
+                               list(ids) if ids is not None else None)
         return None
     # classic pytest: decorated function carries _pytestfixturefunction marker
     marker = getattr(obj, "_pytestfixturefunction", None)
@@ -671,7 +700,14 @@ def _as_fixture(obj):
         func = getattr(obj, "__wrapped__", obj)
         scope = getattr(marker, "scope", "function")
         name = getattr(marker, "name", None)
-        return func, _norm_scope(scope), name or getattr(func, "__name__", None)
+        autouse = bool(getattr(marker, "autouse", False))
+        params = getattr(marker, "params", None)
+        ids = getattr(marker, "ids", None)
+        return FixtureInfo(func, _norm_scope(scope),
+                           name or getattr(func, "__name__", None),
+                           autouse,
+                           list(params) if params is not None else None,
+                           list(ids) if ids is not None else None)
     return None
 
 
@@ -687,14 +723,38 @@ def _norm_scope(scope):
 
 
 def scan_fixtures(module):
-    """Map fixture-name -> (func, scope, source_module) for one module."""
+    """Map fixture-name -> LookupEntry(func, scope, module, autouse, params, ids)."""
     found = {}
     for attr_name, obj in vars(module).items():
         info = _as_fixture(obj)
         if info is not None:
-            func, scope, name = info
-            found[name or attr_name] = (func, scope, module)
+            found[info.name or attr_name] = LookupEntry(
+                info.func, info.scope, module, info.autouse,
+                info.params, info.ids)
     return found
+
+
+# Scope nesting rank: higher scopes set up FIRST (session before module before
+# class before function). Used to order autouse fixtures and unknown scopes
+# sort last.
+_SCOPE_RANK = {"session": 0, "module": 1, "class": 2, "function": 3}
+
+
+def autouse_fixtures(lookup):
+    """Ordered, de-duplicated list of autouse fixture names across `lookup`.
+
+    `lookup` is the ordered list of {name: LookupEntry} tables for a file (test
+    module first, then conftests nearest-first). We collect every entry whose
+    `autouse` is true, keep the FIRST table's entry for a repeated name (matching
+    normal fixture-override precedence: nearest definition wins), then sort by
+    scope rank so higher scopes (session/module) are resolved before lower ones.
+    """
+    seen = {}     # name -> scope (first occurrence wins)
+    for table in lookup:
+        for name, entry in table.items():
+            if entry.autouse and name not in seen:
+                seen[name] = entry.scope
+    return sorted(seen, key=lambda n: (_SCOPE_RANK.get(seen[n], 99), n))
 
 
 # ============================================================================
@@ -854,6 +914,58 @@ def expand_parametrize(marks):
     return combos
 
 
+def _fixture_param_id(value, idx, ids):
+    """Id fragment for one parametrized-fixture value (mirrors @parametrize ids)."""
+    if ids is not None and idx < len(ids) and ids[idx] is not None:
+        return str(ids[idx])
+    p = _param_id(value)
+    return p if p is not None else "p%d" % idx
+
+
+def collect_param_fixtures(fixture_names, lookup):
+    """Ordered list of (name, params, ids) for parametrized fixtures in the
+    dependency closure of `fixture_names`.
+
+    Post-order DFS: a fixture's own (possibly parametrized) dependencies are
+    visited before the fixture itself, so a parametrized dependency is set up
+    before the fixture that consumes it. The traversal order is deterministic
+    (signature order of requested fixtures, then each fixture's own signature
+    order), giving stable ids. Builtins and unknown names are skipped; cycles
+    are guarded by a visiting set.
+    """
+    out = []
+    seen = set()        # names already emitted (closure de-dup)
+    visiting = set()    # cycle guard for the DFS
+
+    def entry_for(name):
+        for table in lookup:
+            if name in table:
+                return table[name]
+        return None
+
+    def visit(name):
+        if name in seen or name in visiting:
+            return
+        entry = entry_for(name)
+        if entry is None:               # builtin / unknown: nothing to expand
+            return
+        visiting.add(name)
+        try:
+            deps = _signature_params(entry.func)
+        except (TypeError, ValueError):
+            deps = []
+        for dep in deps:
+            visit(dep)
+        visiting.discard(name)
+        seen.add(name)
+        if entry.params is not None:
+            out.append((name, list(entry.params), entry.ids))
+
+    for fname in fixture_names:
+        visit(fname)
+    return out
+
+
 # ============================================================================
 # Built-in fixtures: tmp_path, tmp_path_factory, monkeypatch
 # ============================================================================
@@ -987,6 +1099,65 @@ def _import_dotted(path):
 # (see .loop()) so async resources built in a fixture are valid in the test.
 # ============================================================================
 
+class _RequestConfig:
+    """Fallback `request.config` when no worker _Config exists (e.g. self-tests
+    that resolve fixtures without the full main() lifecycle). Mirrors the tiny
+    slice of pytest's Config that fixtures commonly touch."""
+
+    def __init__(self):
+        self.rootdir = ROOTDIR
+        self.args = []
+
+    def getoption(self, name, default=None):
+        return default
+
+    def getini(self, name):
+        return ""
+
+    def addinivalue_line(self, name, line):
+        return None
+
+
+class Request:
+    """The `request` fixture object handed to fixtures/tests that ask for it.
+
+    Exposes the slice of pytest's FixtureRequest that real-world fixtures use:
+      .param            -- the current parametrized-fixture value (settable;
+                           save/restored by the engine around each fixture call).
+      .config           -- the worker config (_Config) or a minimal stub.
+      .node             -- namespace with .name and .nodeid (the result id).
+      .scope            -- "function" (single, per-test request object).
+      .fixturename      -- name of the fixture currently being set up, or None.
+      .addfinalizer(fn) -- register a teardown callback (runs at test teardown).
+      .getfixturevalue(name) -- resolve another fixture on demand.
+
+    One instance per test, cached in ctx.cache["request"]; the engine/lookup/
+    result-id needed by getfixturevalue are read off the TestContext.
+    """
+
+    __slots__ = ("param", "config", "node", "scope", "fixturename", "_ctx")
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+        self.param = None
+        self.config = _CONFIG if _CONFIG is not None else _RequestConfig()
+        self.node = types.SimpleNamespace(
+            name=getattr(ctx, "result_id", None),
+            nodeid=getattr(ctx, "result_id", None))
+        self.scope = "function"
+        self.fixturename = None
+
+    def addfinalizer(self, fn):
+        self._ctx.finalizers.append(fn)
+
+    def getfixturevalue(self, name):
+        engine = self._ctx.engine
+        if engine is None:
+            raise FixtureError(
+                "request.getfixturevalue(%r): no engine bound to request" % name)
+        return engine.resolve(name, self._ctx.lookup, self._ctx, ())
+
+
 class FixtureError(Exception):
     """Setup-side fixture failure (maps to outcome 'error')."""
 
@@ -1110,11 +1281,9 @@ class FixtureEngine:
                 ctx.cache["monkeypatch"] = mp
                 ctx.monkeypatches.append(mp)
             return ctx.cache["monkeypatch"]
-        if name == "request":   # tolerated minimal stub so common fixtures load
+        if name == "request":
             if "request" not in ctx.cache:
-                ctx.cache["request"] = types.SimpleNamespace(
-                    param=None, node=None, config=None,
-                    addfinalizer=lambda f: ctx.finalizers.append(f))
+                ctx.cache["request"] = Request(ctx)
             return ctx.cache["request"]
         if name == "capsys":
             if "capsys" not in ctx.cache:
@@ -1150,13 +1319,14 @@ class FixtureEngine:
                 break
         if entry is None:
             raise FixtureError("fixture %r not found" % name)
-        func, scope, src_module = entry
+        func, scope = entry.func, entry.scope
 
         cache = self._cache_for(scope, ctx)
         if name in cache:
             return cache[name][0]
 
-        value, gen = self._instantiate(name, func, lookup, ctx, stack)
+        value, gen = self._instantiate(name, func, lookup, ctx, stack,
+                                       params=entry.params)
         cache[name] = (value, gen)
         if gen is not None:
             self._teardowns_for(scope, ctx).append((name, gen))
@@ -1180,7 +1350,29 @@ class FixtureEngine:
             return self.class_teardowns
         return ctx.teardowns
 
-    def _instantiate(self, name, func, lookup, ctx, stack):
+    def _instantiate(self, name, func, lookup, ctx, stack, params=None):
+        # If this fixture is parametrized and the current case picked a value for
+        # it, expose that value as request.param for the duration of THIS
+        # fixture's setup. We build/cache the per-test `request` first and
+        # save/restore its .param + .fixturename so nested parametrized fixtures
+        # don't clobber each other.
+        req = None
+        prev_param = None
+        prev_fixturename = None
+        if params is not None and name in ctx.fixture_params:
+            req = self.resolve("request", lookup, ctx, stack)
+            prev_param = req.param
+            prev_fixturename = req.fixturename
+            req.param = ctx.fixture_params[name]
+            req.fixturename = name
+        try:
+            return self._instantiate_inner(name, func, lookup, ctx, stack)
+        finally:
+            if req is not None:
+                req.param = prev_param
+                req.fixturename = prev_fixturename
+
+    def _instantiate_inner(self, name, func, lookup, ctx, stack):
         # Resolve the fixture's own dependencies (recursive)
         kwargs = {}
         try:
@@ -1203,7 +1395,8 @@ class FixtureEngine:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 raise FixtureError("fixture %r raised %s: %s\n%s" % (
-                    name, type(exc).__name__, exc, _format_traceback(exc))) from exc
+                    name, type(exc).__name__, exc,
+                    _format_traceback(exc, style="auto"))) from exc
             return value, None
         if inspect.isasyncgenfunction(func):
             agen = func(**kwargs)
@@ -1215,7 +1408,8 @@ class FixtureEngine:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 raise FixtureError("fixture %r raised %s: %s\n%s" % (
-                    name, type(exc).__name__, exc, _format_traceback(exc))) from exc
+                    name, type(exc).__name__, exc,
+                    _format_traceback(exc, style="auto"))) from exc
             return value, agen      # teardown drains via __anext__ (handled in _drain)
 
         try:
@@ -1227,7 +1421,8 @@ class FixtureEngine:
                 raise
             raise FixtureError(
                 "fixture %r raised %s: %s\n%s" % (
-                    name, type(exc).__name__, exc, _format_traceback(exc))) from exc
+                    name, type(exc).__name__, exc,
+                    _format_traceback(exc, style="auto"))) from exc
         if inspect.isgenerator(result):
             try:
                 value = next(result)
@@ -1238,7 +1433,8 @@ class FixtureEngine:
                     raise
                 raise FixtureError(
                     "fixture %r raised %s: %s\n%s" % (
-                        name, type(exc).__name__, exc, _format_traceback(exc))) from exc
+                        name, type(exc).__name__, exc,
+                    _format_traceback(exc, style="auto"))) from exc
             return value, result
         return result, None
 
@@ -1247,7 +1443,8 @@ class TestContext:
     """Function-scope fixture state for a single test case."""
 
     __slots__ = ("cache", "teardowns", "monkeypatches", "cleanup_dirs",
-                 "finalizers", "capture")
+                 "finalizers", "capture", "fixture_params", "lookup",
+                 "result_id", "engine")
 
     def __init__(self):
         self.cache = {}
@@ -1258,6 +1455,15 @@ class TestContext:
         # The active Capture for this test, set by run_case before fixtures
         # resolve, so capsys/capfd can read its _Tee buffers. None until then.
         self.capture = None
+        # {fixture_name: param_value} for parametrized fixtures this case picked;
+        # consulted by _instantiate to set request.param. Set in run_case.
+        self.fixture_params = {}
+        # Resolution context for the `request` object's getfixturevalue: the
+        # file's fixture lookup tables, this test's result id, and the engine.
+        # All set in run_case before fixtures resolve.
+        self.lookup = []
+        self.result_id = None
+        self.engine = None
 
     def teardown(self, engine):
         # Drain via the engine so async-generator function-scope fixtures
@@ -1556,10 +1762,10 @@ def _enrich_assertion(exc, exc_tb, test_file):
         return None
 
 
-def _format_traceback(exc, limit_lines=TRACEBACK_LINES):
-    # Hide tezt's own worker frames so the traceback starts at the user's test,
-    # the way pytest hides its framework frames. We drop the leading frames whose
-    # file is this worker module (run_case and the call plumbing).
+def _strip_worker_frames(exc):
+    """Return the traceback of `exc` with tezt's own leading worker frames
+    dropped, so the trace starts at the user's test (pytest hides its frames the
+    same way)."""
     tb = exc.__traceback__
     worker_file = globals().get("__file__")
     if worker_file:
@@ -1570,6 +1776,63 @@ def _format_traceback(exc, limit_lines=TRACEBACK_LINES):
                 tb = tb.tb_next
             else:
                 break
+    return tb
+
+
+def _deepest_user_frame(tb):
+    """Walk to the last frame of `tb` (where the exception was actually raised).
+    Returns (filename, lineno) or (None, None) if there is no traceback."""
+    if tb is None:
+        return None, None
+    last = tb
+    while last.tb_next is not None:
+        last = last.tb_next
+    return last.tb_frame.f_code.co_filename, last.tb_lineno
+
+
+def _format_traceback(exc, limit_lines=TRACEBACK_LINES, style=None):
+    """Render `exc`'s traceback honoring the --tb style.
+
+      no    -> None (no traceback at all)
+      line  -> a single line "<path>:<lineno>: <ExcType>: <msg>" for the
+               deepest user frame; no frame dump.
+      short -> each frame's `File "...", line N, in func` location plus the
+               final exception line, with the echoed source-context lines dropped.
+      auto/long -> the full standard traceback (unchanged historical behavior).
+
+    `style` defaults to the module global TB_STYLE.
+    """
+    if style is None:
+        style = TB_STYLE
+
+    tb = _strip_worker_frames(exc)
+
+    if style == "no":
+        return None
+
+    if style == "line":
+        filename, lineno = _deepest_user_frame(tb)
+        exc_line = "".join(
+            tb_module.format_exception_only(type(exc), exc)).strip()
+        if filename is None:
+            return exc_line
+        return "%s:%s: %s" % (filename, lineno, exc_line)
+
+    if style == "short":
+        rows = []
+        # One location line per frame (no source-context echo), then the
+        # exception-only lines (which include any chained-exception note).
+        for frame, flineno in tb_module.walk_tb(tb):
+            code = frame.f_code
+            rows.append('  File "%s", line %d, in %s'
+                        % (code.co_filename, flineno, code.co_name))
+        rows.extend("".join(
+            tb_module.format_exception_only(type(exc), exc)).splitlines())
+        if len(rows) > limit_lines:
+            rows = rows[-limit_lines:]
+        return "\n".join(rows)
+
+    # auto / long: full standard traceback.
     lines = tb_module.format_exception(type(exc), exc, tb)
     text = "".join(lines)
     rows = text.splitlines()
@@ -1839,8 +2102,13 @@ def _evaluate_static_marks(marks, module):
     return skip_reason, xfail
 
 
-def build_plans(module, file_path, qualname):
-    """Return list of plan dicts for one qualname (cached per module/qualname)."""
+def build_plans(module, file_path, qualname, lookup):
+    """Return list of plan dicts for one qualname (cached per module/qualname).
+
+    `lookup` (the file's fixture tables) lets plan-building discover which
+    requested fixtures are parametrized; it is stable per file, so the cache key
+    stays (file_path, qualname) with nothing extra.
+    """
     key = (file_path, qualname)
     cached = _plan_cache.get(key)
     if cached is not None:
@@ -1855,18 +2123,18 @@ def build_plans(module, file_path, qualname):
         func = getattr(cls, fn_name, None)
         if func is None:
             raise FixtureError("method %r not found on %s" % (fn_name, cls_name))
-        plans.extend(_plan_one(module, cls, fn_name, func, prefix=None))
+        plans.extend(_plan_one(module, cls, fn_name, func, lookup, prefix=None))
     else:
         func = getattr(module, qualname, None)
         if func is None or not callable(func):
             raise FixtureError("test %r not found in %s" % (qualname, file_path))
-        plans.extend(_plan_one(module, None, qualname, func, prefix=None))
+        plans.extend(_plan_one(module, None, qualname, func, lookup, prefix=None))
 
     _plan_cache[key] = plans
     return plans
 
 
-def discover_all(module, file_path, id_prefix):
+def discover_all(module, file_path, id_prefix, lookup):
     """qualname '*': all top-level test_* funcs + Test* classes' test_* methods."""
     key = (file_path, "*", id_prefix)
     cached = _plan_cache.get(key)
@@ -1876,7 +2144,7 @@ def discover_all(module, file_path, id_prefix):
     for name in sorted(vars(module)):
         obj = vars(module)[name]
         if name.startswith("test_") and inspect.isfunction(obj):
-            plans.extend(_plan_one(module, None, name, obj,
+            plans.extend(_plan_one(module, None, name, obj, lookup,
                                    prefix="%s::%s" % (id_prefix, name)))
         elif (name.startswith("Test") and inspect.isclass(obj)
               and obj.__module__ == module.__name__
@@ -1885,14 +2153,22 @@ def discover_all(module, file_path, id_prefix):
                 mobj = vars(obj)[mname]
                 if mname.startswith("test_") and callable(mobj):
                     plans.extend(_plan_one(
-                        module, obj, mname, mobj,
+                        module, obj, mname, mobj, lookup,
                         prefix="%s::%s::%s" % (id_prefix, name, mname)))
     _plan_cache[key] = plans
     return plans
 
 
-def _plan_one(module, cls, fn_name, func, prefix):
-    """Expand one function into param cases. Marks evaluated ONCE here (perf)."""
+def _plan_one(module, cls, fn_name, func, lookup, prefix=None):
+    """Expand one function into cases. Marks evaluated ONCE here (perf).
+
+    Two independent expansions multiply together: the test's @parametrize combos
+    (expand_parametrize) and, for every parametrized fixture in the requested
+    fixtures' dependency closure, that fixture's params. The resulting case
+    carries both the @parametrize `params` dict and a `fixture_params` dict
+    {fixture_name: value}; its id fragment is the @parametrize fragment followed
+    by each fixture-param fragment, joined with '-' in closure (post-order).
+    """
     raw = inspect.unwrap(func) if hasattr(func, "__wrapped__") else func
     marks = collect_marks(func, cls, module)
     skip_reason, xfail = _evaluate_static_marks(marks, module)
@@ -1902,16 +2178,41 @@ def _plan_one(module, cls, fn_name, func, prefix):
     except (TypeError, ValueError):
         all_params = []
     is_async = inspect.iscoroutinefunction(raw)
+
     plans = []
     for frag, params in combos:
         fixture_names = [p for p in all_params if p not in params]
-        plans.append({
-            "id_suffix": ("[%s]" % frag) if frag is not None else "",
-            "prefix": prefix,           # None when item id is used directly
-            "func": raw, "cls": cls, "module": module,
-            "params": params, "fixture_names": fixture_names,
-            "skip_reason": skip_reason, "xfail": xfail, "is_async": is_async,
-        })
+        # Parametrized fixtures in this test's dependency closure (deterministic
+        # order). Each contributes a cartesian factor of its param values. We
+        # iterate over INDEX tuples (not value tuples) so duplicate values get
+        # correct positional ids.
+        param_fixtures = collect_param_fixtures(fixture_names, lookup or [])
+        if not param_fixtures:
+            fx_cases = [("", {})]       # single empty fixture-param combo
+        else:
+            index_ranges = [range(len(pf[1])) for pf in param_fixtures]
+            fx_cases = []
+            for index_combo in itertools.product(*index_ranges):
+                frags = []
+                fparams = {}
+                for (fname, vals, fids), pos in zip(param_fixtures, index_combo):
+                    val = vals[pos]
+                    frags.append(_fixture_param_id(val, pos, fids))
+                    fparams[fname] = val
+                fx_cases.append(("-".join(frags), fparams))
+
+        for fx_frag, fx_params in fx_cases:
+            # Compose the id fragment: @parametrize fragment then fixture frags.
+            pieces = [p for p in (frag, fx_frag) if p]
+            combined = "-".join(pieces) if pieces else None
+            plans.append({
+                "id_suffix": ("[%s]" % combined) if combined is not None else "",
+                "prefix": prefix,           # None when item id is used directly
+                "func": raw, "cls": cls, "module": module,
+                "params": params, "fixture_names": fixture_names,
+                "fixture_params": fx_params,
+                "skip_reason": skip_reason, "xfail": xfail, "is_async": is_async,
+            })
     return plans
 
 
@@ -1991,6 +2292,11 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
     # Expose the active capture to fixture resolution (capsys/capfd) BEFORE the
     # `with captured:` block swaps the streams and before fixtures resolve.
     ctx.capture = captured
+    # Resolution context for parametrized fixtures and request.getfixturevalue.
+    ctx.fixture_params = plan.get("fixture_params", {})
+    ctx.lookup = lookup
+    ctx.result_id = result_id
+    ctx.engine = engine
     outcome, message, trace = "passed", None, None
     duration_ms = 0.0
 
@@ -2021,6 +2327,13 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
             # xunit class hooks. cls may be None for a module-level function,
             # which tears down any live class scope (we left the prior class).
             engine.switch_class(cls)
+            # Autouse fixtures run for every test in their scope without being
+            # requested by name. Resolve them BEFORE the explicitly-requested
+            # fixtures, ordered higher-scope-first; caching makes module/session
+            # autouse run once and their teardown fire at the right scope
+            # boundary. An autouse fixture that raises is a setup error.
+            for name in autouse_fixtures(lookup):
+                engine.resolve(name, lookup, ctx, ())
             kwargs = dict(plan["params"])
             for name in plan["fixture_names"]:
                 kwargs[name] = engine.resolve(name, lookup, ctx, ())
@@ -2183,9 +2496,9 @@ def handle_run(cmd, engine, xunit):
         # ---- collect plans ---------------------------------------------------
         try:
             if qualname == "*":
-                plans = discover_all(module, file_path, item_id)
+                plans = discover_all(module, file_path, item_id, lookup)
             else:
-                plans = build_plans(module, file_path, qualname)
+                plans = build_plans(module, file_path, qualname, lookup)
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
@@ -2209,15 +2522,152 @@ _lookup_cache = {}   # file path -> fixture lookup tables
 
 
 # ============================================================================
+# --list-fixtures one-shot mode
+# ============================================================================
+
+# Built-in fixtures the worker provides without any user definition. Listed so
+# `--list-fixtures` reports them alongside user/conftest fixtures.
+_BUILTIN_FIXTURES = [
+    ("tmp_path", "function", "Temporary directory unique to each test."),
+    ("tmp_path_factory", "session", "Session-scoped temporary-directory factory."),
+    ("monkeypatch", "function", "Safely patch/undo attrs, items, and env vars."),
+    ("capsys", "function", "Capture text written to sys.stdout/sys.stderr."),
+    ("capfd", "function", "Capture output at the file-descriptor level."),
+    ("caplog", "function", "Capture log records emitted during the test."),
+    ("recwarn", "function", "Record warnings emitted during the test."),
+    ("request", "function", "Info about the requesting test and fixtures."),
+]
+
+
+def _fixture_location(func):
+    """'<file>:<lineno>' for a fixture function, or '' if undeterminable."""
+    try:
+        src = inspect.getsourcefile(func) or inspect.getfile(func)
+    except (TypeError, OSError):
+        src = None
+    if not src:
+        return ""
+    try:
+        _, lineno = inspect.getsourcelines(func)
+    except (OSError, TypeError):
+        lineno = 0
+    return "%s:%d" % (src, lineno)
+
+
+def _fixture_doc(func):
+    """First line of a fixture func's docstring, or ''."""
+    doc = inspect.getdoc(func)
+    if not doc:
+        return ""
+    return doc.strip().splitlines()[0].strip()
+
+
+def _iter_list_paths(paths):
+    """Yield .py files to scan for fixtures from the given path args.
+
+    A path may be a file (used directly) or a directory (walked for
+    test_*.py / *_test.py, mirroring the Rust collector). Order is
+    deterministic. Non-.py files and missing paths are skipped.
+    """
+    seen = set()
+
+    def add(p):
+        ap = os.path.abspath(p)
+        if ap not in seen and os.path.isfile(ap) and ap.endswith(".py"):
+            seen.add(ap)
+            return [ap]
+        return []
+
+    out = []
+    for p in paths:
+        ap = os.path.abspath(p)
+        if os.path.isdir(ap):
+            for dirpath, dirnames, filenames in os.walk(ap):
+                dirnames.sort()
+                for fn in sorted(filenames):
+                    if (fn.startswith("test_") and fn.endswith(".py")) \
+                            or fn.endswith("_test.py"):
+                        out += add(os.path.join(dirpath, fn))
+        else:
+            out += add(ap)
+    return out
+
+
+def list_fixtures(paths):
+    """Import the root conftest and the given paths (+ their conftest chains),
+    scan every fixture, and emit ONE {"event":"fixtures","fixtures":[...]} event.
+
+    Each fixture entry is {"name","scope","location","doc"}; builtins use
+    location "builtin". The list is de-duplicated by name (first definition wins,
+    matching lookup precedence) and sorted by name. Import errors emit
+    {"event":"fatal", ...} and the function returns 1; success returns 0.
+    """
+    found = {}   # name -> {"name","scope","location","doc"}
+
+    def add(name, scope, location, doc):
+        if name not in found:
+            found[name] = {"name": name, "scope": scope,
+                           "location": location, "doc": doc}
+
+    # Builtins first (so a user fixture of the same name would override only if
+    # added earlier; user fixtures are added after, so builtins win on conflict,
+    # mirroring resolve() which checks builtins before user tables).
+    for name, scope, doc in _BUILTIN_FIXTURES:
+        add(name, scope, "builtin", doc)
+
+    try:
+        # Root conftest (if any) -- import so its fixtures are visible.
+        root_conftest = os.path.join(ROOTDIR, "conftest.py")
+        modules_to_scan = []
+        if os.path.isfile(root_conftest):
+            modules_to_scan.append(import_module_from_path(root_conftest))
+        for fpath in _iter_list_paths(paths):
+            for cf in conftest_chain(fpath):
+                modules_to_scan.append(cf)
+            modules_to_scan.append(import_module_from_path(fpath))
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        emit_event({"event": "fatal",
+                    "message": "%s: %s" % (type(exc).__name__, exc),
+                    "traceback": _format_traceback(exc, style="auto")})
+        return 1
+
+    # Scan each module's fixtures (id-dedup so a shared conftest scans once).
+    scanned = set()
+    for mod in modules_to_scan:
+        if mod is None or id(mod) in scanned:
+            continue
+        scanned.add(id(mod))
+        for name, entry in scan_fixtures(mod).items():
+            add(name, entry.scope, _fixture_location(entry.func),
+                _fixture_doc(entry.func))
+
+    fixtures = [found[k] for k in sorted(found)]
+    emit_event({"event": "fixtures", "fixtures": fixtures})
+    return 0
+
+
+# ============================================================================
 # Main loop
 # ============================================================================
 
 def main():
-    global _REAL_STDOUT, _REAL_STDERR, ROOTDIR, NO_CAPTURE, _CONFIG, _SESSION, _COVERAGE
+    global _REAL_STDOUT, _REAL_STDERR, ROOTDIR, NO_CAPTURE, TB_STYLE, \
+        _CONFIG, _SESSION, _COVERAGE
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--rootdir", required=True)
     parser.add_argument("--no-capture", action="store_true")
+    # Traceback style for failing tests (the Rust side passes --tb <style>).
+    parser.add_argument("--tb", choices=["auto", "long", "short", "line", "no"],
+                        default="auto")
+    # One-shot fixture listing: when set, main() does NOT enter the run loop;
+    # it imports the given paths, scans their fixtures, emits a single
+    # {"event":"fixtures","fixtures":[...]} event, and returns. `paths` are the
+    # positional test files/dirs the Rust side passes alongside --rootdir.
+    parser.add_argument("--list-fixtures", action="store_true")
+    parser.add_argument("paths", nargs="*")
     # ---- coverage.py options (presence of --cov-data-dir enables coverage) ---
     # The Rust supervisor passes exactly these three flags when coverage is on:
     #   --cov-data-dir DIR   target directory for per-worker .coverage data files
@@ -2230,6 +2680,7 @@ def main():
 
     ROOTDIR = os.path.abspath(args.rootdir)
     NO_CAPTURE = args.no_capture
+    TB_STYLE = args.tb
     _REAL_STDOUT = sys.stdout
     _REAL_STDERR = sys.stderr
 
@@ -2262,6 +2713,13 @@ def main():
 
     sys.path.insert(0, ROOTDIR)
     sys.modules["tezt"] = _make_tezt_module()
+
+    # ---- one-shot --list-fixtures mode: list and exit (no run loop) --------
+    # The Rust side spawns the worker with `--list-fixtures --rootdir <dir>
+    # <paths...>`. We import the targets, scan their fixtures, emit a single
+    # `fixtures` event, and return without emitting `ready` or reading stdin.
+    if args.list_fixtures:
+        return list_fixtures(args.paths)
 
     # ---- hook lifecycle: configure + sessionstart (once per worker) --------
     # Build the per-worker config/session, then eagerly discover the ROOT

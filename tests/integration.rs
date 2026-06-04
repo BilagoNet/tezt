@@ -815,3 +815,191 @@ fn capsys_and_approx_fixtures_work() {
         .code(0)
         .stdout(predicate::str::contains("2 passed"));
 }
+
+// ---------------------------------------------------------------------------
+// autouse + parametrized fixtures, end-to-end
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parametrized_fixture_expands_into_cases() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_pf.py"),
+        "import tezt\n\n\n@tezt.fixture(params=[1, 2, 3])\ndef n(request):\n    return request.param\n\n\ndef test_n(n):\n    assert n in (1, 2, 3)\n",
+    )
+    .expect("write test");
+
+    // One collected test function, three param values => three cases run.
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("3 passed"));
+}
+
+#[test]
+fn autouse_fixture_runs_without_being_requested() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // An autouse fixture sets an env var the (non-requesting) test then reads.
+    std::fs::write(
+        dir.path().join("conftest.py"),
+        "import os\nimport tezt\n\n\n@tezt.fixture(autouse=True)\ndef _setenv():\n    os.environ[\"TEZT_AUTOUSE\"] = \"1\"\n",
+    )
+    .expect("write conftest");
+    std::fs::write(
+        dir.path().join("test_au.py"),
+        "import os\n\n\ndef test_sees_autouse():\n    assert os.environ.get(\"TEZT_AUTOUSE\") == \"1\"\n",
+    )
+    .expect("write test");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("1 passed"));
+}
+
+// ---------------------------------------------------------------------------
+// --markers / --fixtures (query modes, no test run)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn markers_lists_builtins_and_registered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[tool.tezt]\nmarkers = [\"slow: long-running tests\"]\n",
+    )
+    .expect("write pyproject");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--markers");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("skip"))
+        .stdout(predicate::str::contains("xfail"))
+        // registered marker shown verbatim, with its description
+        .stdout(predicate::str::contains("slow: long-running tests"));
+}
+
+#[test]
+fn fixtures_lists_conftest_and_builtins() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("conftest.py"),
+        "import tezt\n\n\n@tezt.fixture\ndef my_fixture():\n    \"a demo fixture\"\n    return 1\n",
+    )
+    .expect("write conftest");
+    std::fs::write(
+        dir.path().join("test_f.py"),
+        "def test_uses(my_fixture):\n    assert my_fixture == 1\n",
+    )
+    .expect("write test");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--fixtures")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("my_fixture"))
+        // builtins are always listed
+        .stdout(predicate::str::contains("tmp_path"))
+        .stdout(predicate::str::contains("capsys"));
+}
+
+// ---------------------------------------------------------------------------
+// --tb styles
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tb_no_omits_the_traceback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_tb.py"),
+        "def test_boom():\n    raise ValueError(\"nope\")\n",
+    )
+    .expect("write test");
+
+    // Default keeps a full traceback; --tb=no drops it (the failure header and
+    // message still print, but not the "Traceback (most recent call last)" dump).
+    Command::cargo_bin("tezt")
+        .expect("tezt binary should build")
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("Traceback"));
+
+    Command::cargo_bin("tezt")
+        .expect("tezt binary should build")
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--tb")
+        .arg("no")
+        .arg(".")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("Traceback").not())
+        .stdout(predicate::str::contains("test_boom"));
+}
+
+// ---------------------------------------------------------------------------
+// --stepwise: stop at the first failure, resume there next run
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stepwise_stops_then_resumes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_sw.py"),
+        "def test_a():\n    assert True\n\n\ndef test_b():\n    assert False\n\n\ndef test_c():\n    assert True\n",
+    )
+    .expect("write test");
+
+    // First --stepwise run: a passes, b fails, run stops there (maxfail=1).
+    Command::cargo_bin("tezt")
+        .expect("tezt binary should build")
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--stepwise")
+        .arg(".")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("1 failed"));
+
+    // Second --stepwise run resumes from the failing test_b.
+    Command::cargo_bin("tezt")
+        .expect("tezt binary should build")
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--stepwise")
+        .arg(".")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("resuming from"));
+}

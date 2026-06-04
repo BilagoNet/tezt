@@ -121,11 +121,12 @@ where the line currently sits.
 | Works today | Not yet |
 | --- | --- |
 | `test_*.py` / `*_test.py`, `test_*` functions, `Test*` classes | Installed pytest plugins (`pytest-mock`, `-django`, `-xdist`, …) |
-| Fixtures: function / class / module / session scope, `yield` teardown, `conftest.py` chains | Full AST assertion rewriting (chained comparisons, call operands) |
+| Fixtures: function / class / module / session scope, `autouse`, `params=`, `yield` teardown, `conftest.py` chains | Full AST assertion rewriting (chained comparisons, call operands) |
 | `async def` tests **and** async fixtures, sharing one worker event loop | `--pdb` post-mortem on failure |
 | `parametrize`, including stacked decorators and `ids=` | |
 | Mark expressions (`-m "slow and not net"`) and `-k` name expressions | |
-| `--lf` / `--ff` (last-failed / failed-first) | |
+| `--lf` / `--ff` / `--stepwise` (last-failed / failed-first / resume-on-fail) | |
+| Introspection: `--fixtures`, `--markers`, traceback styles (`--tb`) | |
 | Coverage via `coverage.py` — `--cov` with term / html / xml reports | |
 | conftest `pytest_*` hooks: `configure`, `sessionstart`/`sessionfinish`, `runtest_setup`/`runtest_teardown` | |
 | Rich operator-aware assertion diffs (`==`, `!=`, `in`, lists/dicts/sets/strings) | |
@@ -181,11 +182,15 @@ free.
 | `-m MARKEXPR` | Run only tests whose marks match the expression (e.g. `slow and not net`) |
 | `--lf` / `--last-failed` | Run only the tests that failed last run (all of them, if none did) |
 | `--ff` / `--failed-first` | Run last run's failures first, then everything else |
+| `--stepwise` / `--sw` | Stop at the first failure and resume from it next run (sequential) |
 | `-x` / `--maxfail N` | Stop after the first failure, or after N failures/errors |
 | `-j N` / `--jobs N` | Number of worker processes (default: CPU count) |
 | `-v` / `-q` | One line per test / summary only |
 | `-s` / `--no-capture` | Don't capture test stdout/stderr |
 | `--collect-only` | List the tests that would run, then exit |
+| `--fixtures` | List the fixtures available to the given paths, then exit |
+| `--markers` | List the built-in and registered markers, then exit |
+| `--tb STYLE` | Traceback style: `auto` (default), `long`, `short`, `line`, `no` |
 | `--durations N` | Print the N slowest tests |
 | `--timeout SECONDS` | Kill and report any test that runs longer than this (off by default) |
 | `--json PATH` | Write a machine-readable JSON report |

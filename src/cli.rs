@@ -51,6 +51,29 @@ pub struct Cli {
     #[arg(long = "maxfail", value_name = "N")]
     pub maxfail: Option<usize>,
 
+    /// Stop at the first failure and resume from it on the next run
+    /// (pytest's `--stepwise`). Forces sequential, fail-fast execution
+    /// (`--jobs=1`, `--maxfail=1`) so ordering and the resume point are
+    /// deterministic.
+    #[arg(long = "stepwise", visible_alias = "sw")]
+    pub stepwise: bool,
+
+    /// Traceback style passed to each worker: one of `auto` (the default,
+    /// nothing is forwarded), `long`, `short`, `line`, or `no`.
+    #[arg(long = "tb", value_name = "STYLE", default_value = "auto",
+          value_parser = ["auto", "long", "short", "line", "no"])]
+    pub tb: String,
+
+    /// List the fixtures available to the collected tests and exit (does not
+    /// run anything). Like `--collect-only`, this is a query mode.
+    #[arg(long = "fixtures")]
+    pub fixtures: bool,
+
+    /// List the built-in and project-registered markers and exit (does not
+    /// run anything). Named `markers_list` to avoid clashing with `-m`.
+    #[arg(long = "markers")]
+    pub markers_list: bool,
+
     /// Number of parallel Python workers (default: number of CPUs)
     #[arg(short = 'j', long = "jobs", value_name = "N")]
     pub jobs: Option<usize>,
@@ -231,5 +254,36 @@ mod tests {
     fn explicit_reports_are_preserved_in_order() {
         let cli = parse(&["--cov-report", "term", "--cov-report", "html"]);
         assert_eq!(cli.cov_reports(), vec!["term", "html"]);
+    }
+
+    #[test]
+    fn tb_defaults_to_auto() {
+        // The default keeps the worker's untouched path (no `--tb` forwarded).
+        assert_eq!(parse(&[]).tb, "auto");
+    }
+
+    #[test]
+    fn tb_accepts_known_styles() {
+        for style in ["auto", "long", "short", "line", "no"] {
+            assert_eq!(parse(&["--tb", style]).tb, style);
+        }
+    }
+
+    #[test]
+    fn stepwise_has_sw_alias() {
+        // Both spellings set the same flag; neither is on by default.
+        assert!(!parse(&[]).stepwise);
+        assert!(parse(&["--stepwise"]).stepwise);
+        assert!(parse(&["--sw"]).stepwise);
+    }
+
+    #[test]
+    fn fixtures_and_markers_are_distinct_query_flags() {
+        // `--markers` populates `markers_list`, leaving the `-m` selector (the
+        // `markers` field) untouched — the two must never collide.
+        let cli = parse(&["--markers"]);
+        assert!(cli.markers_list);
+        assert!(cli.markers.is_none());
+        assert!(parse(&["--fixtures"]).fixtures);
     }
 }

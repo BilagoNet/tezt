@@ -67,10 +67,9 @@ fn run() -> Result<i32> {
         color: args.use_color(),
     };
 
-    // Registered markers from `[tool.tezt]`, held for a later `--markers` /
-    // `--strict-markers` change. Parsed and threaded now so the config plumbing
-    // is in place; not yet consumed, hence the explicit discard.
-    let _registered_markers: Vec<String> = cfg_file.markers;
+    // Registered markers from `[tool.tezt]`, consumed by `--markers` below (and
+    // a later `--strict-markers`).
+    let registered_markers: Vec<String> = cfg_file.markers;
 
     // Positional paths: explicit CLI args win; otherwise fall back to the
     // config's `testpaths`; otherwise the historical default of the cwd.
@@ -81,6 +80,17 @@ fn run() -> Result<i32> {
     } else {
         vec![PathBuf::from(".")]
     };
+
+    // --- query modes (no test run) ------------------------------------------
+    // `--markers` and `--fixtures` are introspection queries, like
+    // `--collect-only`: each prints what it found and exits without running any
+    // tests. They are handled here, before collection, so neither pays for it.
+    if args.markers_list {
+        return Ok(list_markers(&registered_markers, &style));
+    }
+    if args.fixtures {
+        return Ok(list_fixtures(&args, &paths, &rootdir, &style));
+    }
 
     // -k expression
     let kexpr = match &args.keyword {
@@ -155,8 +165,37 @@ fn run() -> Result<i32> {
         }
     }
 
-    // Combined deselection count across -k/-m/--lf, computed once from the
-    // pre-selection baseline so the summary and JSON report agree.
+    // --stepwise resume: drop everything before the recorded resume point so
+    // this run picks up where the last one stopped. We operate on the already
+    // -k/-m/--lf-filtered `items`, so stepwise composes with those (their
+    // ordering is unchanged; stepwise only trims a prefix). If the resume id is
+    // no longer present (e.g. the test was renamed or removed) we run all,
+    // mirroring pytest. `--stepwise` itself forces `jobs=1`/`maxfail=1` later so
+    // results arrive in this collection order and the run stops at the first
+    // failure. The trimmed prefix is reflected in `deselected` below.
+    let stepwise_resume: Option<String> = if args.stepwise {
+        cache::load_stepwise(&rootdir)
+    } else {
+        None
+    };
+    if let Some(resume_id) = &stepwise_resume {
+        if let Some(pos) = items
+            .iter()
+            .position(|i| item_is_resume_point(i, resume_id))
+        {
+            if pos > 0 {
+                items.drain(..pos);
+            }
+            if !args.quiet {
+                println!("stepwise: resuming from {resume_id}");
+            }
+        }
+        // If not found, fall through with the full selection (run all).
+    }
+
+    // Combined deselection count across -k/-m/--lf (and any --stepwise resume
+    // trim), computed once from the pre-selection baseline so the summary and
+    // JSON report agree.
     let expected_total: usize = items.iter().map(|i| i.expected_cases()).sum();
     let deselected = before_total.saturating_sub(expected_total);
 
@@ -225,7 +264,17 @@ fn run() -> Result<i32> {
     }
 
     // --- execution ------------------------------------------------------------
-    let jobs = args.jobs.unwrap_or_else(num_cpus::get).max(1);
+    // `--stepwise` forces sequential, fail-fast execution: one worker so results
+    // arrive in collection order (making "the first failure" well-defined and
+    // the resume point stable across runs), and an effective maxfail of 1 so we
+    // stop at that first failure. This overrides any `-j`/`--maxfail`/`-x` for
+    // the run; without it, parallel workers could fail tests out of order and we
+    // could not record a deterministic resume point.
+    let jobs = if args.stepwise {
+        1
+    } else {
+        args.jobs.unwrap_or_else(num_cpus::get).max(1)
+    };
     let python = python::resolve_python(args.python_override().as_deref(), &rootdir);
     if !args.quiet {
         println!(
@@ -271,7 +320,11 @@ fn run() -> Result<i32> {
         rootdir: rootdir.clone(),
         jobs,
         no_capture: args.no_capture,
-        maxfail: args.effective_maxfail(),
+        tb: args.tb.clone(),
+        // `--stepwise` implies maxfail 1; combine with any explicit `-x` /
+        // `--maxfail` by taking the smaller (most aggressive) threshold so
+        // neither relaxes the other.
+        maxfail: stepwise_maxfail(args.stepwise, args.effective_maxfail()),
         timeout: args.timeout.map(std::time::Duration::from_secs_f64),
         priority_files,
         cov: cov_dir.as_ref().map(|dir| runner::CovConfig {
@@ -329,6 +382,18 @@ fn run() -> Result<i32> {
         }
     }
     cache::save_last_failed(&rootdir, &merged);
+
+    // --stepwise: record (or clear) the resume point. With `jobs=1`/`maxfail=1`
+    // forced above, results arrive in collection order and the run stops at the
+    // first bad result — so the first `is_bad()` id is exactly where to resume
+    // next time. If nothing was bad the slice ran clean to the end, so we clear
+    // the resume point (a clean suite resumes from the start). Best-effort;
+    // never fails the run. A Ctrl-C exits via the signal handler before reaching
+    // here, so an interrupted run never spuriously clears the resume point.
+    if args.stepwise {
+        let first_bad = results.iter().find(|r| r.outcome.is_bad());
+        cache::save_stepwise(&rootdir, first_bad.map(|r| r.id.as_str()));
+    }
 
     // Recompute counts from the filtered set (reporter counted live already;
     // keep them consistent).
@@ -521,4 +586,123 @@ fn item_matches_failed(item: &collect::TestItem, failed: &FxHashSet<String>) -> 
             || base.starts_with(&format!("{}::", item.id))
             || fid.starts_with(&format!("{}[", item.id))
     })
+}
+
+/// Is this collected item the `--stepwise` resume point `resume_id`?
+///
+/// `resume_id` is a single recorded case id (e.g. `f.py::test[1]` or
+/// `f.py::test`); items are pre-parametrize-expansion. We reuse the
+/// [`item_matches_failed`] matching so a parametrized resume id maps back to its
+/// (unexpanded) collection item — the resume point is "this item", regardless of
+/// which case first failed.
+fn item_is_resume_point(item: &collect::TestItem, resume_id: &str) -> bool {
+    let base = resume_id.split('[').next().unwrap_or(resume_id);
+    base == item.id
+        || base.starts_with(&format!("{}::", item.id))
+        || resume_id.starts_with(&format!("{}[", item.id))
+}
+
+/// Effective maxfail for the run, folding in `--stepwise`.
+///
+/// `--stepwise` implies a maxfail of 1 (stop at the first failure). When also
+/// given `-x`/`--maxfail=N`, we take the smaller (more aggressive) of the two so
+/// neither relaxes the other; stepwise's 1 is already the minimum, so the result
+/// is `Some(1)` whenever stepwise is on. Without stepwise the explicit value
+/// (if any) is returned unchanged.
+fn stepwise_maxfail(stepwise: bool, explicit: Option<usize>) -> Option<usize> {
+    if !stepwise {
+        return explicit;
+    }
+    match explicit {
+        Some(n) => Some(n.min(1)),
+        None => Some(1),
+    }
+}
+
+/// `--markers`: print the built-in markers (with descriptions) followed by the
+/// project-registered markers from `[tool.tezt] markers`, then exit 0.
+///
+/// No worker is needed — the built-ins are fixed and the registered list comes
+/// straight from config. Each registered entry is printed verbatim under its
+/// own sub-header so they're visually distinct from the built-ins. (Config
+/// currently keeps only the marker *name*, dropping any `: description`, so a
+/// configured `slow: long-running` shows as `slow`; restoring the description
+/// is a `config` change out of scope here.)
+fn list_markers(registered: &[String], style: &report::Style) -> i32 {
+    // (name shown in bold, description) for each built-in marker tezt honors.
+    const BUILTINS: &[(&str, &str)] = &[
+        ("skip", "skip the test unconditionally"),
+        (
+            "skipif(condition, reason=...)",
+            "skip the test if the condition is true",
+        ),
+        (
+            "xfail(reason=...)",
+            "expect the test to fail (report xfailed/xpassed)",
+        ),
+        (
+            "parametrize(argnames, argvalues)",
+            "run the test once per set of argument values",
+        ),
+    ];
+
+    println!("{}", style.bold("built-in markers:"));
+    for (name, desc) in BUILTINS {
+        println!("  {}", style.bold(name));
+        println!("    {}", style.dim(desc));
+    }
+
+    if registered.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style.dim("no registered markers (add them under [tool.tezt] markers)")
+        );
+    } else {
+        println!();
+        println!("{}", style.bold("registered markers:"));
+        for entry in registered {
+            println!("  {entry}");
+        }
+    }
+    EXIT_OK
+}
+
+/// `--fixtures`: list the fixtures available to the collected `paths` and exit.
+///
+/// A query mode (no test run): resolve the interpreter exactly as the run path
+/// does, ask one worker to enumerate fixtures (see
+/// [`runner::list_fixtures`]), and print them grouped one per line as
+/// `name [scope]`, with the docstring and defining location dimmed beneath. The
+/// worker has already sorted the list. Returns [`EXIT_OK`] on success; on any
+/// worker error (failed spawn, no fixtures event, or a `fatal`) it prints a
+/// friendly message to stderr and returns [`EXIT_USAGE`].
+fn list_fixtures(args: &cli::Cli, paths: &[PathBuf], rootdir: &Path, style: &report::Style) -> i32 {
+    let python = python::resolve_python(args.python_override().as_deref(), rootdir);
+    match runner::list_fixtures(&python, rootdir, paths) {
+        Ok(fixtures) => {
+            println!("{}", style.bold("available fixtures:"));
+            for f in &fixtures {
+                println!("  {} {}", f.name, style.dim(&format!("[{}]", f.scope)));
+                if !f.doc.is_empty() {
+                    // Show only the first line of the docstring, like pytest's
+                    // one-line fixture summary; the rest is available in source.
+                    if let Some(first) = f.doc.lines().next() {
+                        let first = first.trim();
+                        if !first.is_empty() {
+                            println!("    {}", style.dim(first));
+                        }
+                    }
+                }
+                if !f.location.is_empty() {
+                    println!("    {}", style.dim(&f.location));
+                }
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("tezt: could not list fixtures: {e:#}");
+            EXIT_USAGE
+        }
+    }
 }

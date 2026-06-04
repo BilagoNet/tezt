@@ -26,8 +26,9 @@ pub struct Config {
     pub addopts: Vec<String>,
     /// Default paths to collect when none are given on the command line.
     pub testpaths: Vec<String>,
-    /// Registered marker names (the part before any `:` in each entry), used by
-    /// `--markers`/`--strict-markers` later. Store the raw entries too.
+    /// Registered markers, each kept verbatim (e.g. `slow: long-running`) so
+    /// `--markers` can show the description. The bare name (before the first
+    /// `:`) can be derived later for a `--strict-markers` check.
     pub markers: Vec<String>,
 }
 
@@ -129,16 +130,16 @@ impl Config {
         }
 
         // markers: pytest stores entries as `name: human description`. We keep
-        // the *names* (everything before the first `:`) since that's what a
-        // future `--strict-markers` will validate against; the raw description
-        // is informational and dropped for now.
+        // each entry verbatim so `--markers` can print the description; the bare
+        // name (everything before the first `:`) can be derived later for a
+        // `--strict-markers` check.
         if let Some(v) = tezt.get("markers") {
             match v {
                 toml::Value::Array(arr) => {
                     cfg.markers = string_array(arr, "markers")
                         .iter()
-                        .map(|entry| entry.split(':').next().unwrap_or(entry).trim().to_owned())
-                        .filter(|name| !name.is_empty())
+                        .map(|entry| entry.trim().to_owned())
+                        .filter(|entry| !entry.is_empty())
                         .collect();
                 }
                 _ => eprintln!("tezt: config: 'markers' must be an array of strings; ignoring"),
@@ -205,11 +206,18 @@ mod tests {
     }
 
     #[test]
-    fn markers_keep_only_the_name_before_colon() {
+    fn markers_are_kept_verbatim() {
         let (cfg, _d) = load_from(
             "[tool.tezt]\nmarkers = [\"slow: marks tests as slow\", \"network\", \"db: needs a database\"]\n",
         );
-        assert_eq!(cfg.markers, vec!["slow", "network", "db"]);
+        assert_eq!(
+            cfg.markers,
+            vec![
+                "slow: marks tests as slow",
+                "network",
+                "db: needs a database"
+            ]
+        );
     }
 
     #[test]

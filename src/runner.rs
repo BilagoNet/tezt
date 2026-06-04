@@ -389,6 +389,7 @@ impl Worker {
         shim: &Path,
         rootdir: &Path,
         no_capture: bool,
+        tb: &str,
         cov: Option<&CovConfig>,
     ) -> Result<Self> {
         let mut cmd = Command::new(python);
@@ -403,6 +404,12 @@ impl Worker {
             .stderr(Stdio::inherit());
         if no_capture {
             cmd.arg("--no-capture");
+        }
+        // Traceback style. `auto` is the worker's own default, so we forward
+        // `--tb <style>` only for an explicit non-default choice and otherwise
+        // leave the default code path (and the worker arg list) untouched.
+        if tb != "auto" {
+            cmd.arg("--tb").arg(tb);
         }
         // Coverage args (the worker enables coverage iff `--cov-data-dir` is
         // present). Each worker writes its own `<data_dir>/.coverage.<pid>`, so
@@ -593,6 +600,10 @@ pub struct RunConfig {
     pub rootdir: PathBuf,
     pub jobs: usize,
     pub no_capture: bool,
+    /// Traceback style forwarded to each worker as `--tb <style>`. `"auto"`
+    /// (the worker's own default) forwards nothing, keeping the default path
+    /// untouched; any other value is passed through verbatim.
+    pub tb: String,
     pub maxfail: Option<usize>,
     /// Per-test wall-clock budget. When set, a watchdog kills any worker that
     /// produces no event within this long and the test is reported as an error.
@@ -617,6 +628,98 @@ fn materialize_worker_shim() -> Result<PathBuf> {
     let path = dir.join(format!("tezt_worker_{}.py", std::process::id()));
     std::fs::write(&path, WORKER_SOURCE)?;
     Ok(path)
+}
+
+// --- fixture listing (`--fixtures`) -----------------------------------------
+//
+// A query mode, parallel to `--collect-only`: instead of running tests we ask a
+// single worker to enumerate the fixtures visible to the given paths and print
+// them, then exit. The worker emits exactly one
+// `{"event":"fixtures","fixtures":[...]}` line; everything else on its stdout is
+// ignored (a `fatal` event surfaces as an error so the caller can report it).
+
+/// One fixture as reported by the worker's `--list-fixtures` mode.
+///
+/// Field order matches the worker's JSON object; `scope`/`location` are always
+/// present, while `doc` is the fixture's docstring (empty when it has none).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FixtureInfo {
+    pub name: String,
+    pub scope: String,
+    pub location: String,
+    #[serde(default)]
+    pub doc: String,
+}
+
+/// The `{"event":"fixtures", ...}` line the worker emits in `--list-fixtures`
+/// mode. Only this event variant is needed here, so — unlike the run-path
+/// [`WireEvent`] — we deserialize a single tagged shape rather than the full
+/// protocol enum.
+#[derive(Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum FixturesEvent {
+    Fixtures { fixtures: Vec<FixtureInfo> },
+    Fatal { message: String },
+}
+
+/// Enumerate the fixtures available to `paths`, by running one worker in its
+/// `--list-fixtures` query mode.
+///
+/// Spawns `<python> -u <shim> --list-fixtures --rootdir <rootdir> <paths…>`
+/// with `current_dir(rootdir)` (so the worker resolves modules exactly as the
+/// run path does), captures stdout, and returns the deserialized fixture list
+/// from the single `{"event":"fixtures",...}` line. The materialized shim is
+/// always cleaned up. Errors — a worker that fails to spawn, exits without
+/// emitting the event, or emits `{"event":"fatal",...}` — are returned as an
+/// `Err` for the caller to turn into a friendly message + usage exit.
+pub fn list_fixtures(python: &str, rootdir: &Path, paths: &[PathBuf]) -> Result<Vec<FixtureInfo>> {
+    let shim = materialize_worker_shim()?;
+
+    let mut cmd = Command::new(python);
+    cmd.arg("-u")
+        .arg(&shim)
+        .arg("--list-fixtures")
+        .arg("--rootdir")
+        .arg(rootdir)
+        .args(paths)
+        .current_dir(rootdir)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to start Python worker (`{python}`)"));
+    // Clean up the shim regardless of how the spawn/collection went.
+    let _ = std::fs::remove_file(&shim);
+    let output = output?;
+
+    // Scan stdout for the one fixtures (or fatal) event. Stray non-JSON lines
+    // are ignored defensively, mirroring `Worker::read_event`.
+    for line in output.stdout.split(|&b| b == b'\n') {
+        let trimmed = line.trim_ascii();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<FixturesEvent>(trimmed) {
+            Ok(FixturesEvent::Fixtures { fixtures }) => return Ok(fixtures),
+            Ok(FixturesEvent::Fatal { message }) => {
+                anyhow::bail!("worker error while listing fixtures: {message}")
+            }
+            Err(_) => continue,
+        }
+    }
+
+    // No fixtures event and no fatal: the worker died or never reported. If it
+    // exited non-zero, say so; otherwise report the missing event generically.
+    if !output.status.success() {
+        anyhow::bail!(
+            "worker exited with {} while listing fixtures",
+            output.status
+        );
+    }
+    anyhow::bail!("worker did not report any fixtures")
 }
 
 /// Run all items on a pool of persistent Python workers, streaming each
@@ -709,6 +812,7 @@ where
         let shim = shim.clone();
         let rootdir = cfg.rootdir.clone();
         let no_capture = cfg.no_capture;
+        let tb = cfg.tb.clone();
         let cov = cfg.cov.clone();
         let activity = activity.clone();
         let timed_out = Arc::clone(&timed_out);
@@ -725,6 +829,7 @@ where
                         &shim,
                         &rootdir,
                         no_capture,
+                        &tb,
                         cov.as_ref(),
                     )?);
                 }
