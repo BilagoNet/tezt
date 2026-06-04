@@ -1,0 +1,22 @@
+<svg width="430" height="150" viewBox="0 0 430 150" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="tezt">
+  <!-- mark -->
+  <g transform="translate(-6 -9) scale(0.66)">
+    <path d="M58 129 L104 175" stroke="#0E1116" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M104 175 L177 102" stroke="#14B8A6" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M216 63 L205 126 L153 74 Z" fill="#14B8A6"/>
+  </g>
+  <!-- wordmark "tezt" -->
+  <g stroke="#0E1116" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- t -->
+    <path d="M185 34 L185 118"/>
+    <path d="M170 58 L205 58"/>
+    <!-- e -->
+    <path d="M222 89 L278 89"/>
+    <path d="M280 89 A30 30 0 1 0 270 111"/>
+    <!-- z -->
+    <path d="M290 58 L334 58 L290 118 L334 118"/>
+    <!-- t -->
+    <path d="M375 34 L375 118"/>
+    <path d="M360 58 L395 58"/>
+  </g>
+</svg>

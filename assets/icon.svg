@@ -1,11 +1,11 @@
 <svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="tezt icon">
   <rect width="256" height="256" rx="56" fill="#0E1116"/>
-  <g transform="translate(128 128) scale(0.8) translate(-128 -128)">
+  <g transform="translate(128 128) scale(0.78) translate(-128 -128)">
     <!-- checkmark: short arm -->
-    <path d="M64 126 L108 170" stroke="#F2F4F5" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M58 129 L104 175" stroke="#F2F4F5" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
     <!-- checkmark: long arm rising into the arrow -->
-    <path d="M108 170 L172 106" stroke="#14B8A6" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M104 175 L177 102" stroke="#14B8A6" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
     <!-- arrowhead -->
-    <path d="M210 68 L200 129 L149 78 Z" fill="#14B8A6"/>
+    <path d="M216 63 L205 126 L153 74 Z" fill="#14B8A6"/>
   </g>
 </svg>
