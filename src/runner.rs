@@ -384,7 +384,13 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(python: &str, shim: &Path, rootdir: &Path, no_capture: bool) -> Result<Self> {
+    fn spawn(
+        python: &str,
+        shim: &Path,
+        rootdir: &Path,
+        no_capture: bool,
+        cov: Option<&CovConfig>,
+    ) -> Result<Self> {
         let mut cmd = Command::new(python);
         cmd.arg("-u")
             .arg(shim)
@@ -397,6 +403,26 @@ impl Worker {
             .stderr(Stdio::inherit());
         if no_capture {
             cmd.arg("--no-capture");
+        }
+        // Coverage args (the worker enables coverage iff `--cov-data-dir` is
+        // present). Each worker writes its own `<data_dir>/.coverage.<pid>`, so
+        // parallel workers never contend for one data file; the parent combines
+        // them after the run. `--cov-source` is repeated once per source; with
+        // none given we hand the worker the rootdir so the whole project is
+        // measured rather than nothing. `--cov-branch` is forwarded only when
+        // requested (branch tracking has a small runtime cost).
+        if let Some(cov) = cov {
+            cmd.arg("--cov-data-dir").arg(&cov.data_dir);
+            if cov.sources.is_empty() {
+                cmd.arg("--cov-source").arg(rootdir);
+            } else {
+                for src in &cov.sources {
+                    cmd.arg("--cov-source").arg(src);
+                }
+            }
+            if cov.branch {
+                cmd.arg("--cov-branch");
+            }
         }
         // Layer 1: put the worker in its own process group so a single kill
         // (killpg) reaches the worker *and* any grandchildren a test spawned.
@@ -545,6 +571,23 @@ impl Drop for Worker {
 
 // --- pool -------------------------------------------------------------------
 
+/// Per-run coverage settings handed to each worker. `None` on [`RunConfig`]
+/// means coverage is off and no `--cov*` args are forwarded.
+///
+/// This is the Rust half of the worker arg contract: the runner only knows how
+/// to *spawn* workers with these settings and where they drop their data files;
+/// starting/stopping the `coverage` instrumentation lives in the Python worker,
+/// and combining/reporting the resulting files lives in `main`. Coverage is
+/// otherwise transparent to scheduling.
+#[derive(Clone)]
+pub struct CovConfig {
+    /// Temp directory where each worker writes `.coverage.<pid>`.
+    pub data_dir: std::path::PathBuf,
+    /// `--cov-source` values (empty => the caller passes the rootdir).
+    pub sources: Vec<String>,
+    pub branch: bool,
+}
+
 pub struct RunConfig {
     pub python: String,
     pub rootdir: PathBuf,
@@ -557,6 +600,8 @@ pub struct RunConfig {
     /// Files whose batches should be scheduled first (`--ff`): those containing
     /// a test that failed on the previous run. Empty = no prioritization.
     pub priority_files: FxHashSet<PathBuf>,
+    /// Per-run coverage settings handed to each worker. `None` = coverage off.
+    pub cov: Option<CovConfig>,
 }
 
 pub struct RunOutput {
@@ -664,6 +709,7 @@ where
         let shim = shim.clone();
         let rootdir = cfg.rootdir.clone();
         let no_capture = cfg.no_capture;
+        let cov = cfg.cov.clone();
         let activity = activity.clone();
         let timed_out = Arc::clone(&timed_out);
 
@@ -674,7 +720,13 @@ where
                     break;
                 }
                 if worker.is_none() {
-                    worker = Some(Worker::spawn(&python, &shim, &rootdir, no_capture)?);
+                    worker = Some(Worker::spawn(
+                        &python,
+                        &shim,
+                        &rootdir,
+                        no_capture,
+                        cov.as_ref(),
+                    )?);
                 }
                 let w = worker.as_mut().unwrap();
                 let pgid = w.pgid;

@@ -92,6 +92,26 @@ pub struct Cli {
     /// Delete the collection cache (.tezt_cache) before running
     #[arg(long = "clear-cache")]
     pub clear_cache: bool,
+
+    /// Measure code coverage during the run (requires the `coverage` package in
+    /// the test interpreter). Coverage is combined and reported after the run.
+    #[arg(long = "cov")]
+    pub cov: bool,
+
+    /// Limit coverage to these sources (a package name or directory; repeatable).
+    /// Defaults to the rootdir. Implies `--cov`.
+    #[arg(long = "cov-source", value_name = "SRC")]
+    pub cov_source: Vec<String>,
+
+    /// Coverage report format(s): `term`, `term-missing`, `html`, `xml`
+    /// (repeatable). Defaults to `term-missing`. Implies `--cov`.
+    #[arg(long = "cov-report", value_name = "KIND",
+          value_parser = ["term", "term-missing", "html", "xml"])]
+    pub cov_report: Vec<String>,
+
+    /// Also measure branch coverage. Implies `--cov`.
+    #[arg(long = "cov-branch")]
+    pub cov_branch: bool,
 }
 
 impl Cli {
@@ -131,5 +151,81 @@ impl Cli {
             Ok(p) if !p.is_empty() => Some(p),
             _ => None,
         }
+    }
+
+    /// Whether coverage measurement is on (any `--cov*` flag enables it).
+    ///
+    /// The sub-flags (`--cov-source`, `--cov-report`, `--cov-branch`) all imply
+    /// `--cov` so a user never has to repeat the bare flag — passing only e.g.
+    /// `--cov-branch` is enough to turn coverage on. Kept as a method (not a
+    /// stored field) so the implication can't drift out of sync with the flags.
+    pub fn cov_enabled(&self) -> bool {
+        self.cov || !self.cov_source.is_empty() || !self.cov_report.is_empty() || self.cov_branch
+    }
+
+    /// Report kinds to produce, defaulting to `term-missing` when coverage is on.
+    ///
+    /// `term-missing` (the per-file table with uncovered line ranges) is the most
+    /// useful default for an interactive run, matching what pytest-cov shows when
+    /// you pass a bare `--cov`. An explicit `--cov-report` list is honored as-is.
+    pub fn cov_reports(&self) -> Vec<String> {
+        if self.cov_report.is_empty() {
+            vec!["term-missing".to_string()]
+        } else {
+            self.cov_report.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse argv the way `main` does, but without requiring a real binary name
+    /// on the front to be threaded through every call site.
+    fn parse(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("tezt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn cov_disabled_by_default() {
+        let cli = parse(&[]);
+        assert!(!cli.cov_enabled());
+    }
+
+    #[test]
+    fn bare_cov_enables() {
+        assert!(parse(&["--cov"]).cov_enabled());
+    }
+
+    #[test]
+    fn cov_branch_alone_enables() {
+        // Each sub-flag implies --cov on its own; --cov-branch is the trickiest
+        // because it carries no value, so assert it explicitly.
+        assert!(parse(&["--cov-branch"]).cov_enabled());
+    }
+
+    #[test]
+    fn cov_source_alone_enables() {
+        let cli = parse(&["--cov-source", "pkg"]);
+        assert!(cli.cov_enabled());
+        assert_eq!(cli.cov_source, vec!["pkg".to_string()]);
+    }
+
+    #[test]
+    fn cov_report_alone_enables() {
+        assert!(parse(&["--cov-report", "xml"]).cov_enabled());
+    }
+
+    #[test]
+    fn default_report_is_term_missing() {
+        // Coverage on but no explicit format => the interactive default.
+        assert_eq!(parse(&["--cov"]).cov_reports(), vec!["term-missing"]);
+    }
+
+    #[test]
+    fn explicit_reports_are_preserved_in_order() {
+        let cli = parse(&["--cov-report", "term", "--cov-report", "html"]);
+        assert_eq!(cli.cov_reports(), vec!["term", "html"]);
     }
 }

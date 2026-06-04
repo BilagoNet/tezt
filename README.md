@@ -120,12 +120,14 @@ where the line currently sits.
 
 | Works today | Not yet |
 | --- | --- |
-| `test_*.py` / `*_test.py`, `test_*` functions, `Test*` classes | The pytest plugin ecosystem (`pytest-mock`, `-django`, `-cov`, …) |
+| `test_*.py` / `*_test.py`, `test_*` functions, `Test*` classes | Installed pytest plugins (`pytest-mock`, `-django`, `-xdist`, …) |
 | Fixtures: function / class / module / session scope, `yield` teardown, `conftest.py` chains | Full AST assertion rewriting (chained comparisons, call operands) |
-| `async def` tests **and** async fixtures, sharing one worker event loop | `--pdb` post-mortem, coverage integration |
-| `parametrize`, including stacked decorators and `ids=` | Custom plugin hooks / `pytest_*` |
+| `async def` tests **and** async fixtures, sharing one worker event loop | `--pdb` post-mortem on failure |
+| `parametrize`, including stacked decorators and `ids=` | |
 | Mark expressions (`-m "slow and not net"`) and `-k` name expressions | |
 | `--lf` / `--ff` (last-failed / failed-first) | |
+| Coverage via `coverage.py` — `--cov` with term / html / xml reports | |
+| conftest `pytest_*` hooks: `configure`, `sessionstart`/`sessionfinish`, `runtest_setup`/`runtest_teardown` | |
 | Rich operator-aware assertion diffs (`==`, `!=`, `in`, lists/dicts/sets/strings) | |
 | `skip` / `skipif` / `xfail` / `xpass` | |
 | xunit hooks: `setup_module`, `setup_class`, `setup_method`, and teardowns | |
@@ -184,6 +186,10 @@ free.
 | `--durations N` | Print the N slowest tests |
 | `--timeout SECONDS` | Kill and report any test that runs longer than this (off by default) |
 | `--json PATH` | Write a machine-readable JSON report |
+| `--cov` | Measure coverage with `coverage.py` and report after the run (needs the `coverage` package) |
+| `--cov-source SRC` | Limit coverage to a package or directory (repeatable; default: the rootdir) |
+| `--cov-report KIND` | `term`, `term-missing` (default), `html`, or `xml` (repeatable) |
+| `--cov-branch` | Also measure branch coverage |
 | `--python EXE` | Interpreter for the workers (also `$TEZT_PYTHON`); accepts a path or an `X.Y` version |
 | `--no-cache` / `--clear-cache` | Skip / delete the collection cache for this run |
 | `--color WHEN` | `auto` (default), `always`, or `never` |
@@ -270,9 +276,9 @@ spawned.
 
 Roughly in the order it's likely to happen:
 
-- [ ] A plugin API, and coverage integration
 - [ ] Full AST assertion rewriting (chained comparisons, call operands)
 - [ ] `--pdb` post-mortem on failure
+- [ ] Installed pytest-plugin compatibility (entry points), beyond conftest hooks
 
 ## FAQ
 

@@ -14,10 +14,10 @@ mod python;
 mod report;
 mod runner;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use rustc_hash::FxHashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 // Exit codes (pytest parity).
@@ -201,6 +201,39 @@ fn run() -> Result<i32> {
             style.dim(&format!("python: {}", python::label(&python)))
         );
     }
+
+    // Coverage setup + pre-check. Done here, right after the interpreter is
+    // resolved and before any worker spawns, so a missing `coverage` package
+    // fails fast with one clear message instead of every worker erroring out.
+    // The data dir is a per-run temp directory (keyed by pid like the worker
+    // shim) into which each worker drops `.coverage.<pid>`; the parent combines
+    // and reports them after the run and removes the dir. `cov_dir` (the Some
+    // case) doubles as "coverage is on" for the post-run block below.
+    let cov_dir: Option<PathBuf> = if args.cov_enabled() {
+        // Fail fast if the test interpreter can't import `coverage`. We check
+        // the *resolved* interpreter (the exact string handed to workers), not
+        // the display label, so the error names what we'll actually run.
+        let importable = std::process::Command::new(&python)
+            .args(["-c", "import coverage"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !importable {
+            anyhow::bail!(
+                "--cov requires the 'coverage' package in the test interpreter ({python}); \
+                 install it with: pip install coverage"
+            );
+        }
+        let dir = std::env::temp_dir().join(format!("tezt-cov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create coverage data dir {}", dir.display()))?;
+        Some(dir)
+    } else {
+        None
+    };
+
     let cfg = runner::RunConfig {
         python,
         rootdir: rootdir.clone(),
@@ -209,6 +242,11 @@ fn run() -> Result<i32> {
         maxfail: args.effective_maxfail(),
         timeout: args.timeout.map(std::time::Duration::from_secs_f64),
         priority_files,
+        cov: cov_dir.as_ref().map(|dir| runner::CovConfig {
+            data_dir: dir.clone(),
+            sources: args.cov_source.clone(),
+            branch: args.cov_branch,
+        }),
     };
 
     let mut reporter = report::Reporter::new(
@@ -283,6 +321,16 @@ fn run() -> Result<i32> {
 
     reporter.print_summary(run_out.wall_time_s, run_out.stopped_early, deselected);
 
+    // Coverage combine + report. Runs regardless of pass/fail (coverage is
+    // observability, not correctness) but only when something actually
+    // executed: the `expected_total == 0` early return above already prevents
+    // an empty run from reaching here, and `--collect-only` returns earlier
+    // still, so neither path measures coverage. Best-effort throughout — a
+    // tooling failure warns on stderr but never changes tezt's exit code.
+    if let Some(dir) = &cov_dir {
+        report_coverage(&cfg.python, &rootdir, dir, &args.cov_reports(), &style);
+    }
+
     if let Some(json_path) = &args.json {
         report::write_json_report(
             json_path,
@@ -297,6 +345,126 @@ fn run() -> Result<i32> {
     }
 
     Ok(exit_code)
+}
+
+/// Combine the per-worker coverage data files and print the requested reports.
+///
+/// This is the parent-side tail of the coverage feature: each worker wrote a
+/// `<data_dir>/.coverage.<pid>` parallel-data file during the run; here we ask
+/// the test interpreter's own `coverage` module to merge them and emit reports.
+/// We deliberately shell out to `<python> -m coverage` rather than reimplement
+/// any of it — the data format is coverage.py's private contract, and using the
+/// same interpreter guarantees a version match with whatever the workers wrote.
+///
+/// Two invariants make the file paths line up:
+///   * `COVERAGE_FILE=<data_dir>/.coverage` — `combine` reads the siblings
+///     `<data_dir>/.coverage.*` and writes the merged db to `COVERAGE_FILE`;
+///     every later `report`/`html`/`xml` then reads that same merged db.
+///   * `current_dir(rootdir)` — source paths in the data files are relative to
+///     the rootdir (where workers ran), and `html`/`xml` outputs land in the
+///     project, not in the throwaway data dir.
+///
+/// Everything is best-effort. Coverage is observability: if the tooling is
+/// missing data, errors, or a report kind fails, we warn on stderr and move on
+/// without touching tezt's exit code. Returns `()` for that reason.
+fn report_coverage(
+    python: &str,
+    rootdir: &Path,
+    data_dir: &Path,
+    reports: &[String],
+    style: &report::Style,
+) {
+    // The merged database lives inside the data dir too, so removing the dir at
+    // the end cleans up both the per-worker files and the combined db. (html/xml
+    // reports are written under the rootdir and so survive.)
+    let coverage_file = data_dir.join(".coverage");
+
+    // Build a `<python> -m coverage <sub-args...>` command with the env + cwd
+    // that make file paths resolve. Stdout/stderr are inherited so the user sees
+    // coverage's own output (the report table, html/xml progress) live.
+    let coverage_cmd = |sub: &[&str]| -> std::process::Command {
+        let mut cmd = std::process::Command::new(python);
+        cmd.arg("-m")
+            .arg("coverage")
+            .args(sub)
+            .env("COVERAGE_FILE", &coverage_file)
+            .current_dir(rootdir);
+        cmd
+    };
+
+    // `combine` merges `<data_dir>/.coverage.*` into `COVERAGE_FILE`. Passing the
+    // directory lets coverage discover the parallel files itself. A non-zero exit
+    // here usually means "no data to combine" — e.g. every test errored before
+    // coverage started, or the workers never wrote a file — which is not a tezt
+    // failure, so we note it and skip the (now pointless) reports.
+    match coverage_cmd(&["combine", "-q", &data_dir.to_string_lossy()]).status() {
+        Ok(status) if status.success() => {}
+        Ok(_) => {
+            eprintln!("tezt: coverage: no coverage data to report");
+            cleanup_cov_dir(data_dir);
+            return;
+        }
+        Err(e) => {
+            eprintln!("tezt: coverage: failed to run `coverage combine`: {e}");
+            cleanup_cov_dir(data_dir);
+            return;
+        }
+    }
+
+    // Emit each requested report kind. `term`/`term-missing` go through the same
+    // `report` subcommand (the latter adds the missing-line column); `html`/`xml`
+    // write files under the rootdir and we point the user at them. Unknown kinds
+    // can't reach here — clap's `value_parser` rejects them at parse time.
+    for kind in reports {
+        let result = match kind.as_str() {
+            "term" => {
+                cov_term_header(style);
+                coverage_cmd(&["report"]).status()
+            }
+            "term-missing" => {
+                cov_term_header(style);
+                coverage_cmd(&["report", "--show-missing"]).status()
+            }
+            "html" => coverage_cmd(&["html", "-d", "htmlcov"]).status(),
+            "xml" => coverage_cmd(&["xml", "-o", "coverage.xml"]).status(),
+            // Defensive: clap restricts the values, so this is unreachable in
+            // practice. Skip rather than panic if that ever changes.
+            other => {
+                eprintln!("tezt: coverage: unknown report kind {other:?}");
+                continue;
+            }
+        };
+        match result {
+            Ok(status) if status.success() => match kind.as_str() {
+                "html" => println!("wrote HTML coverage report to htmlcov/index.html"),
+                "xml" => println!("wrote XML coverage report to coverage.xml"),
+                _ => {}
+            },
+            Ok(status) => {
+                eprintln!("tezt: coverage: `coverage {kind}` exited with {status}");
+            }
+            Err(e) => {
+                eprintln!("tezt: coverage: failed to run `coverage {kind}`: {e}");
+            }
+        }
+    }
+
+    cleanup_cov_dir(data_dir);
+}
+
+/// Print the blank line + bold `coverage:` header shown just above a terminal
+/// coverage table. Kept tiny and separate so both `term` and `term-missing`
+/// render an identical lead-in.
+fn cov_term_header(style: &report::Style) {
+    println!();
+    println!("{}", style.bold("coverage:"));
+}
+
+/// Best-effort removal of the per-run coverage data dir (its `.coverage.*` files
+/// and the merged `.coverage` db). Never errors out: a leftover temp dir is
+/// harmless, and html/xml reports live under the rootdir, not here.
+fn cleanup_cov_dir(data_dir: &Path) {
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 /// Does this collected item correspond to any previously-failed test id?

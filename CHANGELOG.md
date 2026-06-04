@@ -25,6 +25,15 @@ flags can still change between versions.
   unique to each set, a unified diff of two strings. Operands that contain a
   call fall back to the source-line-plus-locals form, so capturing a value
   never re-runs your code.
+- **Coverage** — `--cov` measures coverage with `coverage.py` (each worker
+  records a parallel data file; tezt combines and reports them after the run).
+  `--cov-source` scopes it, `--cov-report` picks `term` / `term-missing` /
+  `html` / `xml`, and `--cov-branch` adds branch coverage.
+- **conftest plugin hooks** — tezt now runs the `pytest_*` hooks that fit its
+  model from `conftest.py`: `pytest_configure`, `pytest_sessionstart` /
+  `pytest_sessionfinish` (per worker), and `pytest_runtest_setup` /
+  `pytest_runtest_teardown` (a setup hook may skip a test). Collection-level
+  hooks aren't supported, since tezt collects in Rust.
 
 ## 0.1.0 — 2026-06-04
 

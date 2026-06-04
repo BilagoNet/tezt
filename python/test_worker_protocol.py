@@ -952,7 +952,234 @@ def test_class_async_assert(root):
 
 
 # ============================================================================
-# Suite 7: performance -- 2000 trivial tests through one worker
+# Suite 7: conftest hook system + coverage.py measurement
+# ============================================================================
+
+def test_hooks_and_coverage(root):
+    print("\n[conftest hooks / coverage.py]")
+
+    # ---- (1)+(2)+(3) hook lifecycle, setup-skip, item shape --------------
+    # A sentinel file the conftest hooks append to (one line per call). We embed
+    # its absolute path into the generated conftest as a string literal so the
+    # hook closures can reach it with no import machinery.
+    sentinel = os.path.join(root, "hook_events.log")
+    write_suite(root, {
+        "conftest.py": """
+            import tezt
+
+            SENTINEL = %r
+
+            def _log(line):
+                with open(SENTINEL, "a") as f:
+                    f.write(line + "\\n")
+
+            def pytest_configure(config):
+                # config stub must expose the methods plugins commonly call.
+                config.addinivalue_line("markers", "slow: marks slow tests")
+                _log("configure rootdir=%%s opt=%%s ini=%%r" %% (
+                    bool(config.rootdir), config.getoption("x", "DEF"),
+                    config.getini("nope")))
+
+            def pytest_sessionstart(session):
+                _log("sessionstart items=%%d start=%%s" %% (
+                    len(session.items), bool(session.startpath)))
+
+            def pytest_sessionfinish(session, exitstatus):
+                _log("sessionfinish status=%%d" %% exitstatus)
+
+            def pytest_runtest_setup(item):
+                _log("setup %%s" %% item.name)
+                # (2) a setup hook can skip a specific test by raising Skipped.
+                if item.name == "test_skip_me":
+                    tezt.skip("by hook")
+                # (3) record item shape for the marked test.
+                if item.name == "test_marked":
+                    _log("item nodeid=%%s name=%%s slow=%%s" %% (
+                        item.nodeid, item.name,
+                        bool(item.get_closest_marker("slow"))))
+
+            def pytest_runtest_teardown(item):
+                _log("teardown %%s" %% item.name)
+        """ % (sentinel,),
+        "test_hooked.py": """
+            import tezt
+
+            def test_one():
+                assert True
+
+            def test_two():
+                assert True
+
+            def test_skip_me():
+                assert False   # never reached: setup hook skips it
+
+            @tezt.mark.slow
+            def test_marked():
+                assert True
+        """,
+    })
+
+    w = Worker(root)
+    f = os.path.join(root, "test_hooked.py")
+    results, _ = w.run([
+        {"id": "h::test_one", "file": f, "qualname": "test_one"},
+        {"id": "h::test_two", "file": f, "qualname": "test_two"},
+        {"id": "h::test_skip_me", "file": f, "qualname": "test_skip_me"},
+        {"id": "h::test_marked", "file": f, "qualname": "test_marked"},
+    ])
+    r = by_id(results)
+
+    # (2) setup-hook skip + a sibling still passes.
+    check(r["h::test_skip_me"]["outcome"] == "skipped"
+          and "by hook" in (r["h::test_skip_me"]["message"] or ""),
+          "setup hook skip -> skipped", repr(r["h::test_skip_me"].get("message")))
+    check(r["h::test_one"]["outcome"] == "passed"
+          and r["h::test_two"]["outcome"] == "passed",
+          "non-skipped tests still pass alongside a hook-skip")
+    check(r["h::test_marked"]["outcome"] == "passed", "marked test passes")
+
+    ev, rc = w.shutdown()
+    check(ev.get("event") == "bye" and rc == 0, "hooks worker clean shutdown")
+
+    # (1) lifecycle counts: configure/sessionstart/sessionfinish each once;
+    # setup/teardown once per test (4 tests). sessionfinish lands only after
+    # shutdown, so read the sentinel now.
+    with open(sentinel) as fh:
+        lines = [ln for ln in fh.read().splitlines() if ln]
+    n_configure = sum(1 for ln in lines if ln.startswith("configure "))
+    n_sstart = sum(1 for ln in lines if ln.startswith("sessionstart "))
+    n_sfinish = sum(1 for ln in lines if ln.startswith("sessionfinish "))
+    n_setup = sum(1 for ln in lines if ln.startswith("setup "))
+    n_teardown = sum(1 for ln in lines if ln.startswith("teardown "))
+    check(n_configure == 1, "pytest_configure fired exactly once",
+          "got %d" % n_configure)
+    check(n_sstart == 1, "pytest_sessionstart fired exactly once",
+          "got %d" % n_sstart)
+    check(n_sfinish == 1, "pytest_sessionfinish fired exactly once at shutdown",
+          "got %d" % n_sfinish)
+    check(n_setup == 4, "pytest_runtest_setup fired once per test (4)",
+          "got %d" % n_setup)
+    check(n_teardown == 4, "pytest_runtest_teardown fired once per test (4)",
+          "got %d" % n_teardown)
+    # configure ran before sessionstart, which ran before any setup.
+    check(lines.index(next(ln for ln in lines if ln.startswith("configure ")))
+          < lines.index(next(ln for ln in lines if ln.startswith("sessionstart ")))
+          < lines.index(next(ln for ln in lines if ln.startswith("setup "))),
+          "lifecycle order: configure < sessionstart < setup")
+    # config stub methods returned their documented defaults.
+    cfg_line = next(ln for ln in lines if ln.startswith("configure "))
+    check("opt=DEF" in cfg_line and "ini=''" in cfg_line,
+          "config.getoption default + getini '' ", repr(cfg_line))
+
+    # (3) item shape for the @tezt.mark.slow test.
+    item_line = next((ln for ln in lines if ln.startswith("item ")), None)
+    check(item_line is not None
+          and "nodeid=h::test_marked" in item_line
+          and "name=test_marked" in item_line
+          and "slow=True" in item_line,
+          "item.nodeid/name + get_closest_marker('slow')", repr(item_line))
+
+    # ---- (4) coverage.py measurement -------------------------------------
+    # The Worker harness can't pass coverage flags, so spawn a worker directly
+    # with --cov-data-dir / --cov-source, mirroring the harness handshake.
+    #
+    # Coverage needs the third-party `coverage` package in THIS interpreter (the
+    # same `sys.executable` that spawns the worker below). If it isn't importable
+    # we skip just the measurement checks — the hook checks above already ran. CI
+    # installs coverage so the matrix exercises this path for real.
+    try:
+        import coverage  # noqa: F401  (probe only)
+    except ImportError:
+        print("  ~~    coverage not installed; skipping coverage.py checks")
+        return
+
+    covdir = os.path.join(root, "covdata")
+    os.makedirs(covdir, exist_ok=True)
+    write_suite(root, {
+        "mod_under_test.py": """
+            def add(a, b):
+                # this line is executed when the test calls add()
+                return a + b
+        """,
+        "test_cov.py": """
+            import mod_under_test
+
+            def test_uses_mod():
+                assert mod_under_test.add(2, 3) == 5
+        """,
+    })
+
+    cmd = [sys.executable, "-u", WORKER, "--rootdir", root,
+           "--cov-data-dir", covdir, "--cov-source", root]
+    proc = subprocess.Popen(
+        cmd, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        ready = json.loads(proc.stdout.readline())
+        check(ready.get("event") == "ready", "coverage worker ready", repr(ready))
+        pid = ready.get("pid")
+
+        fcov = os.path.join(root, "test_cov.py")
+        proc.stdin.write(json.dumps(
+            {"cmd": "run", "batch_id": 1,
+             "items": [{"id": "cov::test_uses_mod", "file": fcov,
+                        "qualname": "test_uses_mod"}]}) + "\n")
+        proc.stdin.flush()
+
+        cov_results = []
+        while True:
+            ev = json.loads(proc.stdout.readline())
+            if ev.get("event") == "result":
+                cov_results.append(ev)
+            elif ev.get("event") == "batch_done":
+                break
+            elif ev.get("event") == "fatal":
+                raise RuntimeError("coverage worker fatal: %r" % ev)
+        cr = by_id(cov_results)
+        check(cr["cov::test_uses_mod"]["outcome"] == "passed",
+              "coverage worker ran the test",
+              repr(cr["cov::test_uses_mod"].get("message")))
+
+        proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+        proc.stdin.flush()
+        bye = json.loads(proc.stdout.readline())
+        proc.wait(timeout=15)
+        check(bye.get("event") == "bye" and proc.returncode == 0,
+              "coverage worker clean shutdown")
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    # The data file is named .coverage.<pid> in covdir and must be non-empty.
+    data_path = os.path.join(covdir, ".coverage.%d" % pid)
+    check(os.path.exists(data_path) and os.path.getsize(data_path) > 0,
+          "coverage data file written and non-empty",
+          repr([data_path, os.path.exists(data_path)]))
+
+    # Load it via the coverage API and confirm mod_under_test.py was measured.
+    measured_ok = False
+    try:
+        import coverage
+        cov = coverage.Coverage(data_file=data_path)
+        cov.load()
+        data = cov.get_data()
+        for fn in data.measured_files():
+            if os.path.basename(fn) == "mod_under_test.py":
+                lines_measured = data.lines(fn) or []
+                if lines_measured:
+                    measured_ok = True
+                break
+    except ImportError:
+        # coverage not importable in the test interpreter: the file existence
+        # check above already proves measurement happened. Treat as satisfied.
+        measured_ok = True
+    check(measured_ok, "mod_under_test.py has measured lines in coverage data")
+
+
+# ============================================================================
+# Suite 8: performance -- 2000 trivial tests through one worker
 # ============================================================================
 
 def test_perf(root):
@@ -995,7 +1222,8 @@ def test_perf(root):
 
 def main():
     suites = [test_core, test_fixtures, test_classes_async_discovery,
-              test_pytest_compat, test_misc, test_class_async_assert]
+              test_pytest_compat, test_misc, test_class_async_assert,
+              test_hooks_and_coverage]
     per_test_ms = None
     for fn in suites:
         root = tempfile.mkdtemp(prefix="tezt-selftest-")

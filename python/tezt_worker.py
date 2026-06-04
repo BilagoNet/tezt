@@ -40,6 +40,17 @@ _REAL_STDERR = None
 ROOTDIR = None
 NO_CAPTURE = False
 
+# Hook lifecycle objects (built once per worker in main()); see the hook
+# section below. _CONFIG/_SESSION are passed to configure/session hooks and
+# carried on every HookItem.
+_CONFIG = None
+_SESSION = None
+
+# coverage.py controller, created lazily in main() ONLY when --cov-data-dir is
+# given. The `coverage` package is third-party, so it is imported lazily there
+# (never at module top level) to keep the worker stdlib-only by default.
+_COVERAGE = None
+
 
 def debug(msg):
     if DEBUG:
@@ -231,6 +242,243 @@ def collect_marks(func, cls, module):
     marks += _coerce_marks(getattr(func, "pytestmark", None))
     marks += _coerce_marks(getattr(func, "teztmark", None))
     return marks
+
+
+# ============================================================================
+# Plugin / hook system -- conftest-based, pytest-compatible hook NAMES.
+#
+# Hooks are plain functions discovered *by name* in conftest modules and in the
+# test module itself; there is no plugin-registration ceremony. We support only
+# the subset of pytest hooks that map onto tezt's execution model:
+#
+#   pytest_configure(config)               -- once per worker, before any import
+#   pytest_sessionstart(session)           -- once per worker, right after configure
+#   pytest_sessionfinish(session, exitstatus) -- once per worker, at shutdown
+#   pytest_runtest_setup(item)             -- before each test's setup phase
+#   pytest_runtest_teardown(item)          -- after each test, during teardown
+#
+# Intentionally NOT supported, because tezt performs *collection* in Rust (the
+# worker only ever executes already-collected items): pytest_collection,
+# pytest_collection_modifyitems, pytest_generate_tests, pytest_itemcollected,
+# pytest_runtest_call/makereport, fixture/plugin manager hooks, etc. There is no
+# place in this worker for collection-time hooks to run, so we deliberately drop
+# them rather than half-implement them.
+#
+# Session semantics: tezt runs a *pool* of these workers, so each worker is its
+# own "session". pytest_sessionstart / pytest_configure therefore fire ONCE PER
+# WORKER (not once per test run), and pytest_sessionfinish fires once per worker
+# at shutdown with exitstatus=0. Plugins that assume a single global session
+# should treat each worker process as an independent session.
+# ============================================================================
+
+# The exact hook names we recognize. Discovery matches function names against
+# this set verbatim (pytest-compatible spelling).
+SUPPORTED_HOOKS = (
+    "pytest_configure",
+    "pytest_sessionstart",
+    "pytest_sessionfinish",
+    "pytest_runtest_setup",
+    "pytest_runtest_teardown",
+)
+
+
+class HookRegistry:
+    """Holds the discovered hook callables per hook name, in registration order.
+
+    De-duplicates by function identity so the same conftest hook (e.g. a root
+    conftest scanned eagerly in main() and again as part of a per-file chain)
+    is never registered twice.
+    """
+
+    def __init__(self):
+        # name -> list of callables (registration order preserved)
+        self._hooks = {name: [] for name in SUPPORTED_HOOKS}
+        # set of id() of already-registered callables (identity de-dup)
+        self._seen = set()
+
+    def register(self, name, func):
+        if name not in self._hooks:
+            return
+        key = id(func)
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self._hooks[name].append(func)
+
+    def get(self, name):
+        return self._hooks.get(name, ())
+
+
+# One registry per worker process (the worker is the session). Created in main()
+# and passed implicitly via this module global so run_case/handle_run can reach
+# it without threading it through every signature.
+_HOOKS = HookRegistry()
+
+# Set of id() of modules already scanned for hooks, so importing the same
+# conftest/test module for many test items only scans it once.
+_scanned_modules = set()
+
+
+def register_hooks_from(module):
+    """Scan vars(module) for callables named exactly like a supported hook and
+    append them to the registry. Cheap and idempotent (id-based de-dup in both
+    the per-module guard here and the registry itself)."""
+    if module is None:
+        return
+    mid = id(module)
+    if mid in _scanned_modules:
+        return
+    _scanned_modules.add(mid)
+    members = vars(module)
+    for name in SUPPORTED_HOOKS:
+        func = members.get(name)
+        if func is not None and callable(func):
+            _HOOKS.register(name, func)
+
+
+def call_hooks(name, **kwargs):
+    """Call every registered hook for `name` in registration order.
+
+    Each hook only receives the kwargs whose names appear in its signature
+    (inspected via _signature_params), so a hook declared as
+    `def pytest_runtest_setup(item)` and one declared with extra/fewer params
+    both work. Errors are NOT caught here -- the caller decides whether an
+    exception should propagate (e.g. a Skipped from a setup hook) or be
+    swallowed (teardown / configure / sessionfinish). This keeps the policy at
+    the call site, matching how existing teardowns swallow their own errors.
+    """
+    for func in _HOOKS.get(name):
+        try:
+            accepted = _signature_params(func)
+        except (TypeError, ValueError):
+            accepted = None
+        if accepted is None:
+            # Could not introspect (e.g. a builtin): call with all kwargs and
+            # let any TypeError surface to the caller's policy.
+            func(**kwargs)
+            continue
+        call_kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+        func(**call_kwargs)
+
+
+class _Config:
+    """Light stand-in for pytest's Config, passed to pytest_configure and held
+    on session/item. Implements the handful of methods plugins commonly call so
+    a typical `config.addinivalue_line("markers", ...)` does not explode."""
+
+    def __init__(self, rootdir):
+        self.rootdir = rootdir
+        # `args` is the list of test paths pytest was invoked with; tezt does
+        # not pass these to the worker, so expose an empty list.
+        self.args = []
+
+    def getoption(self, name, default=None):
+        # tezt has no pytest-style option store; always return the default.
+        return default
+
+    def getini(self, name):
+        # No ini file in the worker; return the empty-string default pytest uses
+        # for unset string inis.
+        return ""
+
+    def addinivalue_line(self, name, line):
+        # Marker/line registration is a no-op here (tezt does not enforce
+        # registered markers), but the method must exist so plugins can call it.
+        return None
+
+
+class _Session:
+    """Light stand-in for pytest's Session. One per worker (see module header).
+
+    `.items` stays empty because collection happened in Rust; we never populate
+    a worker-side item list.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        # pytest exposes both startpath (pathlib) and the legacy startdir; tezt
+        # uses plain strings for both, pointed at the rootdir.
+        self.startpath = config.rootdir
+        self.startdir = config.rootdir
+        self.items = []
+
+
+class HookItem:
+    """The `item` object passed to pytest_runtest_setup / pytest_runtest_teardown.
+
+    Exposes the slice of pytest's Item/Function API that runtest hooks realistically
+    touch: identity (nodeid/name/originalname), location (fspath/path), the test
+    callable/class/module, marker access, and back-references to config/session.
+    Marker queries are answered from the marks collected by collect_marks(); a hook
+    may also add_marker() best-effort (stored on an internal list, not persisted to
+    the function).
+    """
+
+    def __init__(self, nodeid, name, func, cls, module, config, session):
+        self.nodeid = nodeid
+        self.name = name
+        # pytest's Item.originalname is the unparametrized function name; tezt's
+        # `name` already is the bare function name, so they coincide here.
+        self.originalname = name
+        fspath = getattr(module, "__file__", None) or ""
+        self.fspath = fspath
+        self.path = fspath
+        self.function = func
+        self.cls = cls
+        self.module = module
+        self.config = config
+        self.session = session
+        # keywords: mark-name -> _Mark, built from module+class+function marks.
+        marks = collect_marks(func, cls, module)
+        self.keywords = {}
+        # Preserve the collected marks for iter_markers/get_closest_marker; when
+        # a name repeats, the LAST one wins in `keywords` (mirrors a dict), but
+        # iter_markers still returns every occurrence.
+        self._marks = list(marks)
+        for m in marks:
+            self.keywords[m.name] = m
+
+    def get_closest_marker(self, name):
+        """Return the closest _Mark with `name`, or None.
+
+        collect_marks orders marks module -> class -> function, i.e. nearest
+        (function) last, so the closest match is the LAST occurrence.
+        """
+        found = None
+        for m in self._marks:
+            if m.name == name:
+                found = m
+        return found
+
+    def iter_markers(self, name=None):
+        """List of _Mark objects, optionally filtered by name."""
+        if name is None:
+            return list(self._marks)
+        return [m for m in self._marks if m.name == name]
+
+    def add_marker(self, marker):
+        """Best-effort: append a marker (accepts a _MarkDecorator, _Mark, or a
+        bare str name). Stored on this item only; we do not mutate the test
+        function. Mirrors pytest's Item.add_marker just enough for plugins."""
+        mark = None
+        if isinstance(marker, _Mark):
+            mark = marker
+        elif isinstance(marker, _MarkDecorator):
+            # tezt's decorator carries the name in ._name; no bound args yet.
+            mark = _Mark(marker._name, (), {})
+        elif isinstance(marker, str):
+            mark = _Mark(marker, (), {})
+        else:
+            # Unknown shape (e.g. a real pytest MarkDecorator): try to read a
+            # name off it, else ignore silently (best-effort contract).
+            inner = getattr(marker, "mark", marker)
+            mname = getattr(inner, "name", None) or getattr(marker, "_name", None)
+            if mname is None:
+                return
+            mark = _Mark(mname, tuple(getattr(inner, "args", ())),
+                         dict(getattr(inner, "kwargs", {})))
+        self._marks.append(mark)
+        self.keywords[mark.name] = mark
 
 
 # ============================================================================
@@ -1378,8 +1626,18 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
     with captured:
         instance = None
         setup_fn_td = None      # pending teardown_function/teardown_method
+        item = None             # HookItem, built lazily so teardown can reuse it
         try:
             # ---- setup phase (errors -> outcome "error") -------------------
+            # Build the hook `item` first so pytest_runtest_setup runs before
+            # any fixture/xunit setup (mirrors pytest's ordering) and so the
+            # same object is available for pytest_runtest_teardown below. A
+            # Skipped raised here propagates to the setup-phase handler (which
+            # maps it to "skipped"); any other exception becomes "error".
+            item = HookItem(result_id, getattr(func, "__name__", result_id),
+                            func, cls, module, _CONFIG, _SESSION)
+            call_hooks("pytest_runtest_setup", item=item)
+
             xunit.enter_module(module)
             xunit.enter_class(cls)
             # Switch the fixture engine's class scope in lockstep with the
@@ -1454,6 +1712,18 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
                 trace = _format_traceback(exc)
         finally:
             # ---- teardown phase (failures noted but never mask outcome) ----
+            # pytest_runtest_teardown runs first (pytest order: teardown hooks
+            # before fixture/xunit teardown). A hook error here is swallowed and
+            # logged -- a misbehaving teardown hook must never crash the worker
+            # or change a test's recorded outcome (matching how the existing
+            # xunit teardowns swallow their errors). `item` may be None if the
+            # setup hook itself failed before assignment completed.
+            if item is not None:
+                try:
+                    call_hooks("pytest_runtest_teardown", item=item)
+                except Exception:
+                    debug("pytest_runtest_teardown hook raised:\n%s"
+                          % tb_module.format_exc())
             try:
                 if setup_fn_td is not None:
                     setup_fn_td()
@@ -1509,6 +1779,16 @@ def handle_run(cmd, engine, xunit):
                         msg, trace, "", "")
             continue
 
+        # ---- discover hooks from this file's conftest chain + test module --
+        # The root conftest's configure/sessionstart hooks already fired in
+        # main(); here we additionally pick up pytest_runtest_setup/teardown
+        # (and any further configure/sessionfinish) defined in NEARER conftests
+        # or in the test module itself. register_hooks_from is id-guarded so a
+        # conftest shared by many files is scanned only once.
+        for conftest_mod in chain:
+            register_hooks_from(conftest_mod)
+        register_hooks_from(module)
+
         # module-scope fixture boundary
         if engine.current_module_path != file_path:
             xunit.leave_class()
@@ -1556,11 +1836,19 @@ _lookup_cache = {}   # file path -> fixture lookup tables
 # ============================================================================
 
 def main():
-    global _REAL_STDOUT, _REAL_STDERR, ROOTDIR, NO_CAPTURE
+    global _REAL_STDOUT, _REAL_STDERR, ROOTDIR, NO_CAPTURE, _CONFIG, _SESSION, _COVERAGE
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--rootdir", required=True)
     parser.add_argument("--no-capture", action="store_true")
+    # ---- coverage.py options (presence of --cov-data-dir enables coverage) ---
+    # The Rust supervisor passes exactly these three flags when coverage is on:
+    #   --cov-data-dir DIR   target directory for per-worker .coverage data files
+    #   --cov-source SRC     repeatable; restricts measurement to these sources
+    #   --cov-branch         enable branch (not just line) coverage
+    parser.add_argument("--cov-data-dir")
+    parser.add_argument("--cov-source", action="append", default=[])
+    parser.add_argument("--cov-branch", action="store_true")
     args = parser.parse_args()
 
     ROOTDIR = os.path.abspath(args.rootdir)
@@ -1568,8 +1856,71 @@ def main():
     _REAL_STDOUT = sys.stdout
     _REAL_STDERR = sys.stderr
 
+    # ---- start coverage BEFORE any user import -----------------------------
+    # Coverage must begin before we import the virtual `tezt` module and, more
+    # importantly, before any conftest/test module is imported, so that
+    # import-time (module top-level) lines are measured too. `coverage` is a
+    # third-party package imported lazily here only when measurement is asked
+    # for, keeping the default worker stdlib-only. It writes solely to its data
+    # file, never to stdout, so the JSON-Lines protocol is unaffected.
+    if args.cov_data_dir:
+        try:
+            import coverage
+        except ImportError as exc:
+            # The Rust side pre-checks for coverage, but be defensive: emit a
+            # clear fatal and bail rather than crash mid-protocol.
+            emit_event({
+                "event": "fatal",
+                "message": ("coverage measurement requested but the 'coverage'"
+                            " package is not importable: %s" % exc),
+            })
+            return 1
+        data_file = os.path.join(args.cov_data_dir, ".coverage.%d" % os.getpid())
+        _COVERAGE = coverage.Coverage(
+            data_file=data_file,
+            source=(args.cov_source or None),
+            branch=bool(args.cov_branch),
+        )
+        _COVERAGE.start()
+
     sys.path.insert(0, ROOTDIR)
     sys.modules["tezt"] = _make_tezt_module()
+
+    # ---- hook lifecycle: configure + sessionstart (once per worker) --------
+    # Build the per-worker config/session, then eagerly discover the ROOT
+    # conftest's hooks so pytest_configure/pytest_sessionstart see them. Doing
+    # this here (rather than lazily on first run) gives a deterministic, single
+    # configure/sessionstart per worker. Per-file conftests and test modules are
+    # scanned later (in handle_run) for runtest_setup/teardown hooks. If there
+    # is no root conftest we still fire configure/sessionstart with no extra
+    # hooks so the lifecycle is consistent across workers.
+    _CONFIG = _Config(ROOTDIR)
+    _SESSION = _Session(_CONFIG)
+    root_conftest = os.path.join(ROOTDIR, "conftest.py")
+    if os.path.isfile(root_conftest):
+        try:
+            register_hooks_from(import_module_from_path(root_conftest))
+        except BaseException as exc:
+            # A broken root conftest is fatal: tests in that tree cannot run
+            # meaningfully without it. Report and bail (coverage, if started, is
+            # abandoned -- the process is exiting anyway).
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            emit_event({"event": "fatal",
+                        "message": "root conftest import failed: %s" % exc,
+                        "traceback": _format_traceback(exc)})
+            return 1
+    # configure runs before sessionstart (pytest order). Hook errors here are
+    # swallowed+logged: a misbehaving configure/sessionstart must not crash the
+    # worker before it can serve any test.
+    try:
+        call_hooks("pytest_configure", config=_CONFIG)
+    except Exception:
+        debug("pytest_configure hook raised:\n%s" % tb_module.format_exc())
+    try:
+        call_hooks("pytest_sessionstart", session=_SESSION)
+    except Exception:
+        debug("pytest_sessionstart hook raised:\n%s" % tb_module.format_exc())
 
     pyver = "%d.%d.%d" % sys.version_info[:3]
     emit_event({"event": "ready", "pid": os.getpid(), "python": pyver})
@@ -1577,6 +1928,31 @@ def main():
     engine = FixtureEngine()
     xunit = XUnitState()
     stdin = sys.stdin
+
+    def shutdown_worker():
+        # Single shutdown sequence used by BOTH the explicit `shutdown` command
+        # and the stdin-closed path. Order matters:
+        #   1. xunit + fixture session teardown (user teardowns run first),
+        #   2. pytest_sessionfinish (after teardown, exitstatus always 0 since
+        #      tezt has no worker-level pass/fail aggregate -- per-worker session),
+        #   3. stop + save coverage (last, so coverage captures every teardown
+        #      and sessionfinish line too).
+        # Steps 2 and 3 are guarded so a bad hook / coverage error can never
+        # prevent the worker from saying `bye` and exiting cleanly.
+        xunit.leave_class()
+        xunit.leave_module()
+        engine.teardown_session_scope()
+        try:
+            call_hooks("pytest_sessionfinish", session=_SESSION, exitstatus=0)
+        except Exception:
+            debug("pytest_sessionfinish hook raised:\n%s" % tb_module.format_exc())
+        if _COVERAGE is not None:
+            try:
+                _COVERAGE.stop()
+                _COVERAGE.save()
+            except Exception:
+                debug("coverage stop/save failed:\n%s" % tb_module.format_exc())
+        emit_event({"event": "bye"})
 
     try:
         for line in stdin:
@@ -1592,18 +1968,12 @@ def main():
             if kind == "run":
                 handle_run(cmd, engine, xunit)
             elif kind == "shutdown":
-                xunit.leave_class()
-                xunit.leave_module()
-                engine.teardown_session_scope()
-                emit_event({"event": "bye"})
+                shutdown_worker()
                 return 0
             else:
                 debug("unknown cmd: %r" % kind)
         # stdin closed without shutdown: tidy up quietly
-        xunit.leave_class()
-        xunit.leave_module()
-        engine.teardown_session_scope()
-        emit_event({"event": "bye"})
+        shutdown_worker()
         return 0
     except Exception as exc:
         emit_event({"event": "fatal", "message": str(exc) or type(exc).__name__,

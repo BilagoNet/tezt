@@ -600,3 +600,118 @@ fn failed_first_schedules_failures_before_the_rest() {
         "--ff must not deselect anything:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Plugin hooks (conftest pytest_* hooks, run worker-side)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plugin_setup_hook_can_skip_a_test() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A conftest `pytest_runtest_setup` hook that skips one specific test.
+    std::fs::write(
+        dir.path().join("conftest.py"),
+        "import tezt\n\n\ndef pytest_runtest_setup(item):\n    if item.name == \"test_skip_me\":\n        tezt.skip(\"skipped by hook\")\n",
+    )
+    .expect("write conftest");
+    std::fs::write(
+        dir.path().join("test_h.py"),
+        "def test_runs():\n    assert True\n\n\ndef test_skip_me():\n    assert True\n",
+    )
+    .expect("write tests");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("1 passed"))
+        .stdout(predicate::str::contains("1 skipped"));
+}
+
+// ---------------------------------------------------------------------------
+// Coverage (--cov). Skipped unless `coverage` is importable by the test
+// interpreter; CI installs it so the matrix exercises this for real.
+// ---------------------------------------------------------------------------
+
+/// True if `import coverage` succeeds under the test interpreter.
+fn coverage_available() -> bool {
+    StdCommand::new(test_python())
+        .args(["-c", "import coverage"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn coverage_reports_a_term_table() {
+    if !coverage_available() {
+        eprintln!("skipping coverage_reports_a_term_table: coverage not importable");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("calc.py"),
+        "def add(a, b):\n    return a + b\n\n\ndef unused(a, b):\n    return a - b\n",
+    )
+    .expect("write src");
+    std::fs::write(
+        dir.path().join("test_calc.py"),
+        "import calc\n\n\ndef test_add():\n    assert calc.add(2, 3) == 5\n",
+    )
+    .expect("write test");
+
+    // Run from inside the project dir so `import calc` resolves (rootdir is cwd).
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--cov")
+        .arg("--cov-source")
+        .arg(".")
+        .arg("--cov-report")
+        .arg("term-missing")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("1 passed"))
+        // The coverage table: header + the measured source file + a total.
+        .stdout(predicate::str::contains("coverage:"))
+        .stdout(predicate::str::contains("calc.py"))
+        .stdout(predicate::str::contains("TOTAL"));
+}
+
+#[test]
+fn coverage_html_report_is_written() {
+    if !coverage_available() {
+        eprintln!("skipping coverage_html_report_is_written: coverage not importable");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("m.py"), "def f():\n    return 1\n").expect("write src");
+    std::fs::write(
+        dir.path().join("test_m.py"),
+        "import m\n\n\ndef test_f():\n    assert m.f() == 1\n",
+    )
+    .expect("write test");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--cov-source")
+        .arg(".")
+        .arg("--cov-report")
+        .arg("html")
+        .arg(".");
+    cmd.assert().code(0);
+    assert!(
+        dir.path().join("htmlcov").join("index.html").is_file(),
+        "--cov-report html should write htmlcov/index.html"
+    );
+}
