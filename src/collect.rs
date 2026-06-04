@@ -470,11 +470,9 @@ fn pytestmark_assignments(body: &[ast::Stmt]) -> Vec<String> {
                     push_unique(&mut marks, mark_names_from_value(&a.value));
                 }
             }
-            ast::Stmt::AnnAssign(a) => {
-                if is_pytestmark_name(&a.target) {
-                    if let Some(v) = &a.value {
-                        push_unique(&mut marks, mark_names_from_value(v));
-                    }
+            ast::Stmt::AnnAssign(a) if is_pytestmark_name(&a.target) => {
+                if let Some(v) = &a.value {
+                    push_unique(&mut marks, mark_names_from_value(v));
                 }
             }
             _ => {}
