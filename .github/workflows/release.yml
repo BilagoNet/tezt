@@ -134,9 +134,12 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" dist/* binaries/* \
             --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes \
           || gh release upload "${GITHUB_REF_NAME}" dist/* binaries/* --repo "${GITHUB_REPOSITORY}" --clobber
-      # Requires a configured PyPI trusted publisher for this repo + workflow.
+      # Opt-in: set repo variable PUBLISH_TO_PYPI=true once a PyPI trusted
+      # publisher is configured for this repo + workflow. Until then, tagging
+      # still produces the GitHub Release above; this step is simply skipped, so
+      # a release never fails just because PyPI isn't set up yet.
       - name: Publish wheels to PyPI
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_TO_PYPI == 'true'
         uses: PyO3/maturin-action@v1
         with:
           command: upload
