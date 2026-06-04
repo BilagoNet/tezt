@@ -63,6 +63,10 @@ pub struct Cli {
     #[arg(long = "json", value_name = "PATH")]
     pub json: Option<PathBuf>,
 
+    /// Write a JUnit XML report to the given path (for CI test reporters)
+    #[arg(long = "junitxml", value_name = "PATH")]
+    pub junitxml: Option<PathBuf>,
+
     /// Do not capture test stdout/stderr (stream to terminal via worker stderr)
     #[arg(short = 's', long = "no-capture")]
     pub no_capture: bool,

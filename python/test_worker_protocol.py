@@ -1179,7 +1179,112 @@ def test_hooks_and_coverage(root):
 
 
 # ============================================================================
-# Suite 8: performance -- 2000 trivial tests through one worker
+# Suite 8: pytest-compat test-writing conveniences
+#   capsys / capfd, caplog, recwarn + tezt.warns, tezt.approx
+# ============================================================================
+
+def test_pytest_conveniences(root):
+    print("\n[capsys / caplog / recwarn / warns / approx]")
+    write_suite(root, {
+        "test_conv.py": """
+            import logging
+            import warnings
+            import tezt
+
+            def test_capsys(capsys):
+                print("hello")
+                out, err = capsys.readouterr()
+                assert out == "hello\\n"
+
+            def test_capfd(capfd):
+                print("via-capfd")
+                out, err = capfd.readouterr()
+                assert "via-capfd" in out
+
+            def test_caplog(caplog):
+                caplog.set_level(logging.WARNING)
+                logging.getLogger("x").warning("boom")
+                assert "boom" in caplog.text
+                assert caplog.records[0].levelno == logging.WARNING
+                assert caplog.messages == ["boom"]
+
+            def test_recwarn(recwarn):
+                warnings.warn("dep", DeprecationWarning)
+                assert len(recwarn) >= 1
+                assert recwarn.pop(DeprecationWarning)
+
+            def test_warns_match():
+                with tezt.warns(UserWarning, match="hi"):
+                    warnings.warn("hi there", UserWarning)
+
+            def test_warns_no_warning():
+                with tezt.warns(UserWarning):
+                    pass   # raises no warning -> Failed -> failed
+
+            def test_approx_scalar():
+                assert 0.1 + 0.2 == tezt.approx(0.3)
+
+            def test_approx_scalar_rev():
+                assert tezt.approx(0.3) == 0.1 + 0.2
+
+            def test_approx_seq():
+                assert [0.1 + 0.2, 1.0] == tezt.approx([0.3, 1.0])
+
+            def test_approx_dict():
+                assert {"a": 0.1 + 0.2, "b": 1.0} == tezt.approx({"a": 0.3, "b": 1.0})
+
+            def test_approx_fail():
+                assert 0.3 == tezt.approx(0.31)
+        """,
+    })
+    w = Worker(root)
+    f = os.path.join(root, "test_conv.py")
+    quals = ["test_capsys", "test_capfd", "test_caplog", "test_recwarn",
+             "test_warns_match", "test_warns_no_warning",
+             "test_approx_scalar", "test_approx_scalar_rev", "test_approx_seq",
+             "test_approx_dict", "test_approx_fail"]
+    results, _ = w.run([{"id": q, "file": f, "qualname": q} for q in quals])
+    r = by_id(results)
+
+    check(r["test_capsys"]["outcome"] == "passed", "capsys readouterr",
+          repr(r["test_capsys"].get("message")))
+    check("hello" in r["test_capsys"]["stdout"],
+          "capsys text still flows to stdout result field")
+    check(r["test_capfd"]["outcome"] == "passed",
+          "capfd shares Python-level capture", repr(r["test_capfd"].get("message")))
+
+    check(r["test_caplog"]["outcome"] == "passed",
+          "caplog records + text + set_level", repr(r["test_caplog"].get("message")))
+
+    check(r["test_recwarn"]["outcome"] == "passed",
+          "recwarn records + pop", repr(r["test_recwarn"].get("message")))
+
+    check(r["test_warns_match"]["outcome"] == "passed",
+          "tezt.warns(match=) matches", repr(r["test_warns_match"].get("message")))
+    check(r["test_warns_no_warning"]["outcome"] == "failed"
+          and "DID NOT WARN" in (r["test_warns_no_warning"]["message"] or ""),
+          "tezt.warns with no warning -> failed",
+          repr(r["test_warns_no_warning"].get("message")))
+
+    check(r["test_approx_scalar"]["outcome"] == "passed",
+          "approx scalar (0.1+0.2 == 0.3)", repr(r["test_approx_scalar"].get("message")))
+    check(r["test_approx_scalar_rev"]["outcome"] == "passed",
+          "approx scalar reversed (approx(x) == actual)",
+          repr(r["test_approx_scalar_rev"].get("message")))
+    check(r["test_approx_seq"]["outcome"] == "passed",
+          "approx sequence elementwise", repr(r["test_approx_seq"].get("message")))
+    check(r["test_approx_dict"]["outcome"] == "passed",
+          "approx mapping by key", repr(r["test_approx_dict"].get("message")))
+    check(r["test_approx_fail"]["outcome"] == "failed",
+          "approx mismatch (0.3 != approx(0.31)) -> failed",
+          repr(r["test_approx_fail"].get("message")))
+
+    ev, rc = w.shutdown()
+    check(ev.get("event") == "bye" and rc == 0, "conveniences worker clean shutdown")
+
+
+# ============================================================================
+# Suite 9: performance -- 2000 trivial tests through one worker
 # ============================================================================
 
 def test_perf(root):
@@ -1223,7 +1328,7 @@ def test_perf(root):
 def main():
     suites = [test_core, test_fixtures, test_classes_async_discovery,
               test_pytest_compat, test_misc, test_class_async_assert,
-              test_hooks_and_coverage]
+              test_hooks_and_coverage, test_pytest_conveniences]
     per_test_ms = None
     for fn in suites:
         root = tempfile.mkdtemp(prefix="tezt-selftest-")

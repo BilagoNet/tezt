@@ -9,6 +9,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod cache;
 mod cli;
 mod collect;
+mod config;
 mod kexpr;
 mod python;
 mod report;
@@ -38,16 +39,47 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    let args = cli::Cli::parse();
+    // Resolve the rootdir *before* parsing argv: the config file lives there,
+    // and its `addopts` must be folded into the argument list we actually parse.
+    let rootdir = std::env::current_dir()?;
+    let cfg_file = config::Config::load(&rootdir);
+
+    // addopts merge: prepend the config's default args to the user's argv, then
+    // parse the combined list. The order is `[program] + addopts + user-args` so
+    // that an explicitly-passed flag follows (and, for clap's last-wins value
+    // options like `--color`/`--maxfail`, overrides) the config default. Boolean
+    // flags can't be *un*set this way (there's no `--no-foo`), so addopts should
+    // hold opt-ins (`-q`, `--tb=short`) rather than things a user must later turn
+    // off — same caveat pytest's addopts carries. We splice after `argv[0]`
+    // because `parse_from` expects the program name in slot 0.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let args = if cfg_file.addopts.is_empty() {
+        cli::Cli::parse_from(&argv)
+    } else {
+        let prog = argv.first().cloned().unwrap_or_else(|| "tezt".into());
+        let combined = std::iter::once(prog)
+            .chain(cfg_file.addopts.iter().map(std::ffi::OsString::from))
+            .chain(argv.into_iter().skip(1));
+        cli::Cli::parse_from(combined)
+    };
+
     let style = report::Style {
         color: args.use_color(),
     };
 
-    let rootdir = std::env::current_dir()?;
-    let paths: Vec<PathBuf> = if args.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
+    // Registered markers from `[tool.tezt]`, held for a later `--markers` /
+    // `--strict-markers` change. Parsed and threaded now so the config plumbing
+    // is in place; not yet consumed, hence the explicit discard.
+    let _registered_markers: Vec<String> = cfg_file.markers;
+
+    // Positional paths: explicit CLI args win; otherwise fall back to the
+    // config's `testpaths`; otherwise the historical default of the cwd.
+    let paths: Vec<PathBuf> = if !args.paths.is_empty() {
         args.paths.clone()
+    } else if !cfg_file.testpaths.is_empty() {
+        cfg_file.testpaths.iter().map(PathBuf::from).collect()
+    } else {
+        vec![PathBuf::from(".")]
     };
 
     // -k expression
@@ -340,6 +372,16 @@ fn run() -> Result<i32> {
             run_out.wall_time_s,
             exit_code,
             run_out.stopped_early,
+            &results,
+        )?;
+    }
+
+    if let Some(junit_path) = &args.junitxml {
+        report::write_junit_xml(
+            junit_path,
+            expected_total,
+            &counts,
+            run_out.wall_time_s,
             &results,
         )?;
     }

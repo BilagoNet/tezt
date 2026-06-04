@@ -11,6 +11,7 @@ Pure stdlib, Python 3.8+ compatible. Single file by design.
 import argparse
 import ast
 import asyncio
+import collections
 import difflib
 import inspect
 import io
@@ -18,6 +19,8 @@ import importlib.util
 import itertools
 import json
 import linecache
+import logging
+import math
 import os
 import re
 import shutil
@@ -26,6 +29,7 @@ import tempfile
 import time
 import traceback as tb_module
 import types
+import warnings
 
 # ============================================================================
 # Constants / globals
@@ -197,6 +201,53 @@ def _make_tezt_module():
                 raise Failed("pattern %r not found in %r" % (self.match, str(evalue)))
             return True  # swallow the expected exception
 
+    class warns:
+        """Context manager asserting a block emits a matching warning (mirrors raises).
+
+        On __enter__ it records warnings via warnings.catch_warnings(record=True);
+        on a clean __exit__ it asserts at least one recorded warning is an instance
+        of `expected_warning` (and, if `match` is given, that re.search(match, ...)
+        matches one of them). Recorded warnings are exposed as .list and the first
+        match as .matched after the block. Real exceptions propagate untouched.
+        """
+
+        def __init__(self, expected_warning, match=None):
+            self.expected_warning = expected_warning
+            self.match = match
+            self.list = []
+            self.matched = None
+            self._cm = None
+
+        def __enter__(self):
+            self._cm = warnings.catch_warnings(record=True)
+            self.list = self._cm.__enter__()
+            warnings.simplefilter("always")
+            return self
+
+        def __exit__(self, etype, evalue, etb):
+            self._cm.__exit__(etype, evalue, etb)
+            if etype is not None:
+                return False  # let real exceptions propagate
+            matches = [w for w in self.list
+                       if issubclass(w.category, self.expected_warning)]
+            if not matches:
+                raise Failed("DID NOT WARN %r" % (self.expected_warning,))
+            if self.match is not None:
+                matched = [w for w in matches
+                           if re.search(self.match, str(w.message))]
+                if not matched:
+                    raise Failed("pattern %r not found in any of %r" % (
+                        self.match, [str(w.message) for w in matches]))
+                self.matched = matched[0]
+            else:
+                self.matched = matches[0]
+            return False
+
+    def approx(expected, rel=None, abs=None, nan_ok=False):
+        # Dispatch to a type-specific comparator (scalar / sequence / mapping).
+        # See ApproxBase and friends below for the comparison semantics.
+        return _make_approx(expected, rel, abs, nan_ok)
+
     mod.fixture = fixture
     mod.parametrize = parametrize
     mod.mark = _MarkNamespace()
@@ -204,10 +255,122 @@ def _make_tezt_module():
     mod.fail = fail
     mod.xfail = xfail
     mod.raises = raises
+    mod.warns = warns
+    mod.approx = approx
     mod.Skipped = Skipped
     mod.Failed = Failed
     mod.XFailed = XFailed
     return mod
+
+
+# ============================================================================
+# tezt.approx -- approximate equality for floats, sequences, and mappings.
+# Defaults mirror pytest: a value is "close" when the difference is within
+# max(rel * abs(expected), abs). Comparison works in both directions because
+# Python falls back to the right operand's __eq__ when the left returns
+# NotImplemented (and the bare object on the other side does). __ne__ negates.
+# ============================================================================
+
+# pytest's default relative / absolute tolerances.
+_APPROX_REL = 1e-6
+_APPROX_ABS = 1e-12
+
+
+class ApproxBase:
+    """Base for approx comparators: holds the expected value and tolerances."""
+
+    def __init__(self, expected, rel, abs, nan_ok):
+        self.expected = expected
+        self.rel = rel
+        self.abs = abs
+        self.nan_ok = nan_ok
+
+    def __ne__(self, actual):
+        return not (self == actual)
+
+    # Python tries actual.__eq__(self) first; only when that returns
+    # NotImplemented does it try self.__eq__(actual). Because the other operand
+    # is an ordinary value, both `actual == approx(x)` and `approx(x) == actual`
+    # route through our __eq__, giving symmetric comparison.
+
+
+class ApproxScalar(ApproxBase):
+    """Approximate equality for a single int/float/complex."""
+
+    def _tolerance(self):
+        rel = self.rel if self.rel is not None else _APPROX_REL
+        abs_ = self.abs if self.abs is not None else _APPROX_ABS
+        return max(rel * abs(self.expected), abs_)
+
+    def __eq__(self, actual):
+        exp = self.expected
+        # NaN never equals NaN unless explicitly allowed.
+        try:
+            exp_nan = isinstance(exp, float) and math.isnan(exp)
+            act_nan = isinstance(actual, float) and math.isnan(actual)
+        except TypeError:
+            return NotImplemented
+        if exp_nan or act_nan:
+            return bool(self.nan_ok and exp_nan and act_nan)
+        # Infinities: equal only if identical (no finite tolerance bridges inf).
+        try:
+            if math.isinf(exp) or (isinstance(actual, float) and math.isinf(actual)):
+                return exp == actual
+        except TypeError:
+            pass
+        try:
+            return abs(actual - exp) <= self._tolerance()
+        except TypeError:
+            return NotImplemented
+
+    def __repr__(self):
+        try:
+            tol = self._tolerance()
+        except TypeError:
+            return "approx(%r)" % (self.expected,)
+        return "approx(%r %s %.3g)" % (self.expected, "±", tol)
+
+
+class ApproxSequence(ApproxBase):
+    """Approximate equality for a list/tuple, compared elementwise."""
+
+    def __eq__(self, actual):
+        if not isinstance(actual, (list, tuple)):
+            return NotImplemented
+        if len(actual) != len(self.expected):
+            return False
+        for a, e in zip(actual, self.expected):
+            if not (ApproxScalar(e, self.rel, self.abs, self.nan_ok) == a):
+                return False
+        return True
+
+    def __repr__(self):
+        return "approx(%r)" % (self.expected,)
+
+
+class ApproxMapping(ApproxBase):
+    """Approximate equality for a dict, compared key-by-key."""
+
+    def __eq__(self, actual):
+        if not isinstance(actual, dict):
+            return NotImplemented
+        if set(actual.keys()) != set(self.expected.keys()):
+            return False
+        for k, e in self.expected.items():
+            if not (ApproxScalar(e, self.rel, self.abs, self.nan_ok) == actual[k]):
+                return False
+        return True
+
+    def __repr__(self):
+        return "approx(%r)" % (self.expected,)
+
+
+def _make_approx(expected, rel, abs, nan_ok):
+    if isinstance(expected, dict):
+        return ApproxMapping(expected, rel, abs, nan_ok)
+    if isinstance(expected, (list, tuple)):
+        return ApproxSequence(expected, rel, abs, nan_ok)
+    return ApproxScalar(expected, rel, abs, nan_ok)
 
 
 # ============================================================================
@@ -953,6 +1116,31 @@ class FixtureEngine:
                     param=None, node=None, config=None,
                     addfinalizer=lambda f: ctx.finalizers.append(f))
             return ctx.cache["request"]
+        if name == "capsys":
+            if "capsys" not in ctx.cache:
+                cap = ctx.capture
+                ctx.cache["capsys"] = CaptureFixture(cap.out, cap.err)
+            return ctx.cache["capsys"]
+        if name == "capfd":
+            # tezt captures at the Python level (sys.stdout/err swap), so capfd
+            # shares that same capture -- true fd-level/C-extension capture is
+            # not separated. This is a documented approximation (no os.dup2).
+            if "capfd" not in ctx.cache:
+                cap = ctx.capture
+                ctx.cache["capfd"] = CaptureFixture(cap.out, cap.err)
+            return ctx.cache["capfd"]
+        if name == "caplog":
+            if "caplog" not in ctx.cache:
+                cl = LogCaptureFixture()
+                ctx.cache["caplog"] = cl
+                ctx.finalizers.append(cl.remove)
+            return ctx.cache["caplog"]
+        if name == "recwarn":
+            if "recwarn" not in ctx.cache:
+                rw = WarningsRecorder()
+                ctx.cache["recwarn"] = rw
+                ctx.finalizers.append(rw.finish)
+            return ctx.cache["recwarn"]
 
         # user-defined fixture lookup
         entry = None
@@ -1058,7 +1246,8 @@ class FixtureEngine:
 class TestContext:
     """Function-scope fixture state for a single test case."""
 
-    __slots__ = ("cache", "teardowns", "monkeypatches", "cleanup_dirs", "finalizers")
+    __slots__ = ("cache", "teardowns", "monkeypatches", "cleanup_dirs",
+                 "finalizers", "capture")
 
     def __init__(self):
         self.cache = {}
@@ -1066,6 +1255,9 @@ class TestContext:
         self.monkeypatches = []
         self.cleanup_dirs = []
         self.finalizers = []
+        # The active Capture for this test, set by run_case before fixtures
+        # resolve, so capsys/capfd can read its _Tee buffers. None until then.
+        self.capture = None
 
     def teardown(self, engine):
         # Drain via the engine so async-generator function-scope fixtures
@@ -1435,6 +1627,188 @@ class Capture:
 
 
 # ============================================================================
+# Test-writing fixtures built on top of the capture machinery:
+#   capsys / capfd -> CaptureFixture (reads the active _Tee buffers)
+#   caplog         -> LogCaptureFixture (root-logger handler)
+#   recwarn        -> WarningsRecorder (warnings.catch_warnings(record=True))
+# These are resolved by name in FixtureEngine.resolve (alongside tmp_path).
+# ============================================================================
+
+CaptureResult = collections.namedtuple("CaptureResult", ["out", "err"])
+
+
+class CaptureFixture:
+    """pytest-style capsys/capfd: read text captured by the active Capture.
+
+    tezt already swaps sys.stdout/sys.stderr to _Tee objects for the duration of
+    each test (see Capture). This fixture reads those buffers; readouterr()
+    returns the text written SINCE THE LAST readouterr() (per-stream offsets into
+    the _Tee buffer's full value). The captured text still flows to the normal
+    stdout/stderr result fields -- this only offers a programmatic view.
+    """
+
+    def __init__(self, out_tee, err_tee):
+        self._out = out_tee
+        self._err = err_tee
+        self._out_pos = 0
+        self._err_pos = 0
+
+    def readouterr(self):
+        out_all = self._out.buf.getvalue()
+        err_all = self._err.buf.getvalue()
+        out = out_all[self._out_pos:]
+        err = err_all[self._err_pos:]
+        self._out_pos = len(out_all)
+        self._err_pos = len(err_all)
+        return CaptureResult(out, err)
+
+    def disabled(self):
+        # Best-effort: temporarily restore the real streams so writes inside the
+        # block pass through instead of being captured. tezt captures at the
+        # Python level, so this swaps sys.stdout/err to the _Tee mirrors (the
+        # real streams under --no-capture) or the saved real streams, and back.
+        fixture = self
+
+        class _Disabled:
+            def __enter__(self_inner):
+                self_inner._old = (sys.stdout, sys.stderr)
+                sys.stdout = fixture._out.mirror or _REAL_STDOUT or sys.__stdout__
+                sys.stderr = fixture._err.mirror or _REAL_STDERR or sys.__stderr__
+                return fixture
+
+            def __exit__(self_inner, *a):
+                sys.stdout, sys.stderr = self_inner._old
+                return False
+
+        return _Disabled()
+
+
+class LogCaptureFixture:
+    """pytest-style caplog: capture logging records via a root-logger handler.
+
+    On construction a handler is attached to the root logger that appends every
+    LogRecord to .records. set_level/at_level adjust levels (remembering the
+    originals); remove() detaches the handler and restores any changed levels and
+    is registered as a ctx finalizer so it runs during test teardown.
+    """
+
+    def __init__(self):
+        records = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self_inner, record):
+                records.append(record)
+
+        self.records = records
+        self.handler = _ListHandler()
+        self._formatter = logging.Formatter()
+        self._root = logging.getLogger()
+        # Remember the root logger's level so set_level can restore it, and so
+        # the handler sees records even if the root level was higher.
+        self._initial_handler_level = self.handler.level
+        # (logger, original_level) pairs to restore on teardown, newest last.
+        self._level_restores = []
+        self._root.addHandler(self.handler)
+
+    # -- introspection --------------------------------------------------------
+
+    @property
+    def text(self):
+        return "\n".join(self._formatter.format(r) for r in self.records)
+
+    @property
+    def messages(self):
+        return [r.getMessage() for r in self.records]
+
+    @property
+    def record_tuples(self):
+        return [(r.name, r.levelno, r.getMessage()) for r in self.records]
+
+    # -- level control --------------------------------------------------------
+
+    def _logger(self, logger):
+        if logger is None:
+            return self._root
+        if isinstance(logger, str):
+            return logging.getLogger(logger)
+        return logger
+
+    def set_level(self, level, logger=None):
+        lg = self._logger(logger)
+        self._level_restores.append((lg, lg.level))
+        lg.setLevel(level)
+        self.handler.setLevel(level)
+
+    def at_level(self, level, logger=None):
+        fixture = self
+        lg = self._logger(logger)
+
+        class _AtLevel:
+            def __enter__(self_inner):
+                self_inner._old_logger = lg.level
+                self_inner._old_handler = fixture.handler.level
+                lg.setLevel(level)
+                fixture.handler.setLevel(level)
+                return fixture
+
+            def __exit__(self_inner, *a):
+                lg.setLevel(self_inner._old_logger)
+                fixture.handler.setLevel(self_inner._old_handler)
+                return False
+
+        return _AtLevel()
+
+    def clear(self):
+        del self.records[:]
+
+    # -- teardown -------------------------------------------------------------
+
+    def remove(self):
+        self._root.removeHandler(self.handler)
+        for lg, old in reversed(self._level_restores):
+            lg.setLevel(old)
+        self._level_restores = []
+        self.handler.setLevel(self._initial_handler_level)
+
+
+class WarningsRecorder:
+    """pytest-style recwarn: records warnings for the duration of a test.
+
+    Wraps warnings.catch_warnings(record=True): __enter__ gives the recorded
+    list and simplefilter('always') ensures every warning is captured. finish()
+    closes the context and is registered as a ctx finalizer. Exposes list-like
+    access plus pop()/clear() over the recorded warnings.
+    """
+
+    def __init__(self):
+        self._cm = warnings.catch_warnings(record=True)
+        self.list = self._cm.__enter__()
+        warnings.simplefilter("always")
+
+    def __len__(self):
+        return len(self.list)
+
+    def __getitem__(self, i):
+        return self.list[i]
+
+    def __iter__(self):
+        return iter(self.list)
+
+    def pop(self, cls=Warning):
+        """Return and remove the first recorded warning matching `cls`."""
+        for i, w in enumerate(self.list):
+            if issubclass(w.category, cls):
+                return self.list.pop(i)
+        raise AssertionError("%r not found in warning list" % cls)
+
+    def clear(self):
+        del self.list[:]
+
+    def finish(self):
+        self._cm.__exit__(None, None, None)
+
+
+# ============================================================================
 # Collection -- turn a (file, qualname) item into concrete test "plan" dicts.
 # Plans are param-expanded specs cached per (module file, qualname) so that
 # signature inspection and mark evaluation happen once per test function.
@@ -1614,6 +1988,9 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
     func, cls, module = plan["func"], plan["cls"], plan["module"]
     captured = Capture()
     ctx = TestContext()
+    # Expose the active capture to fixture resolution (capsys/capfd) BEFORE the
+    # `with captured:` block swaps the streams and before fixtures resolve.
+    ctx.capture = captured
     outcome, message, trace = "passed", None, None
     duration_ms = 0.0
 

@@ -715,3 +715,103 @@ fn coverage_html_report_is_written() {
         "--cov-report html should write htmlcov/index.html"
     );
 }
+
+// ---------------------------------------------------------------------------
+// pyproject.toml [tool.tezt] config: addopts + testpaths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_addopts_and_testpaths_are_applied() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("sub")).expect("mkdir sub");
+    std::fs::write(
+        dir.path().join("sub").join("test_x.py"),
+        "def test_in_sub():\n    assert True\n",
+    )
+    .expect("write sub test");
+    // A test OUTSIDE testpaths must not be collected when no path is given.
+    std::fs::write(
+        dir.path().join("test_ignored.py"),
+        "def test_ignored():\n    assert True\n",
+    )
+    .expect("write ignored test");
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[tool.tezt]\naddopts = [\"-v\"]\ntestpaths = [\"sub\"]\n",
+    )
+    .expect("write pyproject");
+
+    // No path and no flags on the command line: `testpaths` supplies the path,
+    // `addopts = ["-v"]` supplies verbose mode.
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never");
+    cmd.assert()
+        .code(0)
+        // testpaths scoped collection to sub/ (test_ignored never runs).
+        .stdout(predicate::str::contains("1 passed"))
+        .stdout(predicate::str::contains("test_ignored").not())
+        // addopts -v turned on the per-test line.
+        .stdout(predicate::str::contains("PASS"))
+        .stdout(predicate::str::contains("test_in_sub"));
+}
+
+// ---------------------------------------------------------------------------
+// --junitxml
+// ---------------------------------------------------------------------------
+
+#[test]
+fn junitxml_report_is_written_and_well_shaped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_j.py"),
+        "def test_ok():\n    assert True\n\n\ndef test_bad():\n    assert 1 == 2\n",
+    )
+    .expect("write test");
+
+    let xml_path = dir.path().join("out.xml");
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--junitxml")
+        .arg(&xml_path)
+        .arg(".");
+    cmd.assert().code(1);
+
+    let xml = std::fs::read_to_string(&xml_path).expect("junit xml should exist");
+    assert!(
+        xml.contains("<testsuite"),
+        "has a testsuite element:\n{xml}"
+    );
+    assert!(xml.contains("tests=\"2\""), "two tests:\n{xml}");
+    assert!(xml.contains("failures=\"1\""), "one failure:\n{xml}");
+    assert!(xml.contains("<failure"), "has a failure element:\n{xml}");
+}
+
+// ---------------------------------------------------------------------------
+// capsys + approx, end-to-end through the real worker
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capsys_and_approx_fixtures_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_conv.py"),
+        "import tezt\n\n\ndef test_capsys(capsys):\n    print(\"hi\")\n    out, err = capsys.readouterr()\n    assert out == \"hi\\n\"\n\n\ndef test_approx():\n    assert 0.1 + 0.2 == tezt.approx(0.3)\n",
+    )
+    .expect("write test");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("2 passed"));
+}

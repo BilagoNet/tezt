@@ -34,6 +34,16 @@ flags can still change between versions.
   `pytest_sessionfinish` (per worker), and `pytest_runtest_setup` /
   `pytest_runtest_teardown` (a setup hook may skip a test). Collection-level
   hooks aren't supported, since tezt collects in Rust.
+- **Capture / log / warning fixtures** — `capsys` and `capfd` (read captured
+  stdout/stderr via `readouterr()`), `caplog` (records / `text` / `set_level` /
+  `at_level`), and `recwarn` plus a `tezt.warns(...)` context manager.
+- **`tezt.approx`** — tolerant float comparison for scalars, sequences, and
+  mappings (`assert 0.1 + 0.2 == tezt.approx(0.3)`).
+- **Config file** — an optional `[tool.tezt]` table in `pyproject.toml` with
+  `addopts` (default flags, folded in before your argv), `testpaths` (used when
+  no path is given), and `markers`.
+- **JUnit XML** — `--junitxml PATH` writes a `<testsuites>` report that CI test
+  reporters (GitHub, GitLab, Jenkins) understand.
 
 ## 0.1.0 — 2026-06-04
 

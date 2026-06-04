@@ -28,6 +28,9 @@ rustpython-parser = "=0.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+# Parses pyproject.toml's [tool.tezt] for project defaults (addopts/testpaths/
+# markers). See src/config.rs — parsing is best-effort and never fails the run.
+toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

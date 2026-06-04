@@ -129,9 +129,12 @@ where the line currently sits.
 | Coverage via `coverage.py` — `--cov` with term / html / xml reports | |
 | conftest `pytest_*` hooks: `configure`, `sessionstart`/`sessionfinish`, `runtest_setup`/`runtest_teardown` | |
 | Rich operator-aware assertion diffs (`==`, `!=`, `in`, lists/dicts/sets/strings) | |
+| `approx` for float comparison; `raises` / `warns` context managers | |
 | `skip` / `skipif` / `xfail` / `xpass` | |
+| Config via `pyproject.toml` `[tool.tezt]` (`addopts`, `testpaths`, `markers`) | |
+| Reports: `--json` and JUnit XML (`--junitxml`) | |
 | xunit hooks: `setup_module`, `setup_class`, `setup_method`, and teardowns | |
-| Builtins: `tmp_path`, `tmp_path_factory`, `monkeypatch` | |
+| Builtins: `tmp_path`, `tmp_path_factory`, `monkeypatch`, `capsys`/`capfd`, `caplog`, `recwarn` | |
 | Reads `@pytest.fixture` / `@pytest.mark.*`, or the zero-dep `import tezt` API | |
 
 When a bare `assert` fails, tezt shows an operator-aware diff: for `assert a == b` (and
@@ -186,6 +189,7 @@ free.
 | `--durations N` | Print the N slowest tests |
 | `--timeout SECONDS` | Kill and report any test that runs longer than this (off by default) |
 | `--json PATH` | Write a machine-readable JSON report |
+| `--junitxml PATH` | Write a JUnit XML report (for CI test reporters) |
 | `--cov` | Measure coverage with `coverage.py` and report after the run (needs the `coverage` package) |
 | `--cov-source SRC` | Limit coverage to a package or directory (repeatable; default: the rootdir) |
 | `--cov-report KIND` | `term`, `term-missing` (default), `html`, or `xml` (repeatable) |
@@ -196,7 +200,20 @@ free.
 
 ## Configuration
 
-tezt is configured by flags and a few environment variables; there is no config file yet.
+tezt reads an optional `[tool.tezt]` table from `pyproject.toml` in the rootdir:
+
+```toml
+[tool.tezt]
+addopts = ["-v", "--tb=short"]   # default flags, prepended to every run
+testpaths = ["tests"]            # where to look when no path is given
+markers = ["slow: long-running", "net: needs network"]
+```
+
+`addopts` is folded in before your command-line args, so an explicit flag still
+wins (same as pytest). `testpaths` is used only when you pass no path. Everything
+is overridable on the command line.
+
+The rest is environment variables:
 
 - **`TEZT_PYTHON`** — the interpreter to run workers with. When unset, tezt looks for an
   active virtualenv (`$VIRTUAL_ENV`), then `$CONDA_PREFIX`, then a project-local `.venv`
