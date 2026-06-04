@@ -1003,3 +1003,75 @@ fn stepwise_stops_then_resumes() {
         .code(1)
         .stdout(predicate::str::contains("resuming from"));
 }
+
+// ---------------------------------------------------------------------------
+// pytest-conformance regression guards (verified against pytest by the
+// differential harness in `conformance/`; these pin the behavior in CI without
+// needing pytest installed, using the always-available `tezt` API).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nested_test_classes_are_collected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_nested.py"),
+        "class TestOuter:\n    class TestInner:\n        def test_deep(self):\n            assert True\n\n    def test_shallow(self):\n        assert True\n",
+    )
+    .expect("write test");
+
+    // pytest collects nested Test* classes; tezt must too (no silently-skipped
+    // tests). Both the nested and the shallow method run.
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("2 passed"));
+}
+
+#[test]
+fn strict_xfail_that_passes_is_a_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_sx.py"),
+        "import tezt\n\n\n@tezt.mark.xfail(strict=True, reason=\"must fail\")\ndef test_x():\n    assert True\n",
+    )
+    .expect("write test");
+
+    // pytest: a strict xfail that unexpectedly passes is reported as failed.
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    cmd.assert()
+        .code(1)
+        .stdout(predicate::str::contains("1 failed"));
+}
+
+#[test]
+fn fixture_teardown_error_makes_the_test_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_td.py"),
+        "import tezt\n\n\n@tezt.fixture\ndef res():\n    yield 1\n    raise RuntimeError(\"teardown boom\")\n\n\ndef test_uses(res):\n    assert res == 1\n",
+    )
+    .expect("write test");
+
+    // pytest: a yield-fixture teardown that raises turns the passing test into
+    // an error.
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    cmd.assert()
+        .code(1)
+        // matches both "1 error" and "1 errors"
+        .stdout(predicate::str::contains("1 error"));
+}

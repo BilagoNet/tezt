@@ -268,44 +268,7 @@ fn parse_file(source: &str, abs: &Path, rel: &str) -> CollectedFile {
                 }
             }
             ast::Stmt::ClassDef(c) if c.name.as_str().starts_with("Test") => {
-                if class_has_init(c) {
-                    continue; // pytest skips Test* classes with __init__
-                }
-                // Class-level marks = class decorators + class-body
-                // `pytestmark`/`teztmark` + the module-level marks. Each method
-                // inherits these and adds its own decorator marks.
-                let mut class_marks = decorator_marks(&c.decorator_list);
-                push_unique(&mut class_marks, pytestmark_assignments(&c.body));
-                push_unique(&mut class_marks, module_marks.clone());
-                for sub in &c.body {
-                    match sub {
-                        ast::Stmt::FunctionDef(m) if is_test_name(m.name.as_str()) => {
-                            let marks =
-                                combine_marks(decorator_marks(&m.decorator_list), &class_marks);
-                            items.push(make_item(
-                                rel,
-                                abs,
-                                m.name.as_str(),
-                                Some(c.name.as_str()),
-                                &m.decorator_list,
-                                marks,
-                            ));
-                        }
-                        ast::Stmt::AsyncFunctionDef(m) if is_test_name(m.name.as_str()) => {
-                            let marks =
-                                combine_marks(decorator_marks(&m.decorator_list), &class_marks);
-                            items.push(make_item(
-                                rel,
-                                abs,
-                                m.name.as_str(),
-                                Some(c.name.as_str()),
-                                &m.decorator_list,
-                                marks,
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
+                collect_class(&mut items, rel, abs, c, c.name.as_str(), &module_marks);
             }
             _ => {}
         }
@@ -364,6 +327,62 @@ fn to_cache(collected: &CollectedFile, key: crate::cache::FileCacheKey) -> Cache
 
 fn is_test_name(name: &str) -> bool {
     name == "test" || name.starts_with("test_")
+}
+
+/// Collect tests from a `Test*` class, recursing into nested `Test*` classes
+/// (which pytest collects too). `class_path` is the `::`-joined qualname prefix
+/// (`TestOuter` → `TestOuter::TestInner`), so a nested method's id reads
+/// `file.py::TestOuter::TestInner::test_deep`. `inherited_marks` carries the
+/// module's marks plus every ancestor class's marks, so nesting inherits marks
+/// the way pytest does.
+fn collect_class(
+    items: &mut Vec<TestItem>,
+    rel: &str,
+    abs: &Path,
+    c: &ast::StmtClassDef,
+    class_path: &str,
+    inherited_marks: &[String],
+) {
+    if class_has_init(c) {
+        return; // pytest skips Test* classes with __init__
+    }
+    // This class's effective marks = its decorators + its body `pytestmark` +
+    // everything inherited from the module and any enclosing classes.
+    let mut class_marks = decorator_marks(&c.decorator_list);
+    push_unique(&mut class_marks, pytestmark_assignments(&c.body));
+    push_unique(&mut class_marks, inherited_marks.to_vec());
+
+    for sub in &c.body {
+        match sub {
+            ast::Stmt::FunctionDef(m) if is_test_name(m.name.as_str()) => {
+                let marks = combine_marks(decorator_marks(&m.decorator_list), &class_marks);
+                items.push(make_item(
+                    rel,
+                    abs,
+                    m.name.as_str(),
+                    Some(class_path),
+                    &m.decorator_list,
+                    marks,
+                ));
+            }
+            ast::Stmt::AsyncFunctionDef(m) if is_test_name(m.name.as_str()) => {
+                let marks = combine_marks(decorator_marks(&m.decorator_list), &class_marks);
+                items.push(make_item(
+                    rel,
+                    abs,
+                    m.name.as_str(),
+                    Some(class_path),
+                    &m.decorator_list,
+                    marks,
+                ));
+            }
+            ast::Stmt::ClassDef(inner) if inner.name.as_str().starts_with("Test") => {
+                let nested = format!("{class_path}::{}", inner.name.as_str());
+                collect_class(items, rel, abs, inner, &nested, &class_marks);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn class_has_init(c: &ast::StmtClassDef) -> bool {

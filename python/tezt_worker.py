@@ -1252,6 +1252,28 @@ class FixtureEngine:
             except Exception:
                 debug("teardown of fixture %r raised:\n%s" % (name, tb_module.format_exc()))
 
+    def _drain_capture(self, teardowns):
+        """Like `_drain`, but return the FIRST exception a teardown raised (or
+        None), draining all of them either way. Used for function-scope
+        teardown, where pytest turns a fixture-teardown failure into an `error`
+        on the test that used the fixture (higher scopes stay swallowed —
+        their boundary isn't tied to a single test)."""
+        first = None
+        while teardowns:
+            name, gen = teardowns.pop()
+            try:
+                if hasattr(gen, "__anext__"):
+                    self.loop().run_until_complete(gen.__anext__())
+                else:
+                    next(gen)
+            except (StopIteration, StopAsyncIteration):
+                pass
+            except Exception as exc:
+                if first is None:
+                    first = exc
+                debug("teardown of fixture %r raised:\n%s" % (name, tb_module.format_exc()))
+        return first
+
     # -- resolution ------------------------------------------------------------
 
     def resolve(self, name, lookup, ctx, stack):
@@ -1466,14 +1488,17 @@ class TestContext:
         self.engine = None
 
     def teardown(self, engine):
-        # Drain via the engine so async-generator function-scope fixtures
-        # resume on the shared loop (engine._drain handles both kinds).
-        engine._drain(self.teardowns)
+        # Drain via the engine so async-generator function-scope fixtures resume
+        # on the shared loop. Return the first teardown/finalizer exception (or
+        # None) so the caller can turn a teardown failure into an `error`, like
+        # pytest. monkeypatch.undo and tmp cleanup are internal and stay quiet.
+        err = engine._drain_capture(self.teardowns)
         for f in reversed(self.finalizers):
             try:
                 f()
-            except Exception:
-                pass
+            except Exception as exc:
+                if err is None:
+                    err = exc
         for mp in self.monkeypatches:
             try:
                 mp.undo()
@@ -1481,6 +1506,7 @@ class TestContext:
                 pass
         for d in self.cleanup_dirs:
             shutil.rmtree(d, ignore_errors=True)
+        return err
 
 
 # signature-parameter cache (perf): func -> list of positional/keyword names
@@ -2081,25 +2107,44 @@ _plan_cache = {}
 
 
 def _evaluate_static_marks(marks, module):
-    """Pre-evaluate skip/skipif/xfail marks. Returns (skip_reason, xfail_flag)."""
+    """Pre-evaluate skip/skipif/xfail marks.
+
+    Returns (skip_reason, xfail_flag, xfail_strict). `xfail` honors an optional
+    condition (first positional arg or `condition=`) and `strict=`: pytest treats
+    a strict xfail that unexpectedly passes as a failure, not an xpass.
+    """
     skip_reason = None
     xfail = False
+    xfail_strict = False
+
+    def _eval_cond(cond):
+        if isinstance(cond, str):
+            try:
+                return bool(eval(cond, {"sys": sys, "os": os, "config": None, **vars(module)}))
+            except Exception:
+                return True
+        return bool(cond)
+
     for m in marks:
         if m.name == "skip":
             skip_reason = m.kwargs.get("reason") or (m.args[0] if m.args else "") or "skip"
         elif m.name == "skipif":
-            cond = m.args[0] if m.args else m.kwargs.get("condition", False)
-            if isinstance(cond, str):
-                try:
-                    cond = eval(cond, {"sys": sys, "os": os,
-                                       "config": None, **vars(module)})
-                except Exception:
-                    cond = True
-            if cond:
+            raw = m.args[0] if m.args else m.kwargs.get("condition", False)
+            if _eval_cond(raw):
                 skip_reason = m.kwargs.get("reason", "") or "skipif"
         elif m.name == "xfail":
-            xfail = True
-    return skip_reason, xfail
+            # xfail with no condition always applies; with one, only when truthy.
+            if m.args:
+                applies = _eval_cond(m.args[0])
+            elif "condition" in m.kwargs:
+                applies = _eval_cond(m.kwargs["condition"])
+            else:
+                applies = True
+            if applies:
+                xfail = True
+                if m.kwargs.get("strict"):
+                    xfail_strict = True
+    return skip_reason, xfail, xfail_strict
 
 
 def build_plans(module, file_path, qualname, lookup):
@@ -2116,13 +2161,22 @@ def build_plans(module, file_path, qualname, lookup):
 
     plans = []
     if "::" in qualname:
-        cls_name, _, fn_name = qualname.partition("::")
-        cls = getattr(module, cls_name, None)
-        if cls is None or not inspect.isclass(cls):
-            raise FixtureError("class %r not found in %s" % (cls_name, file_path))
+        # Walk the class chain so nested classes resolve too:
+        # `TestOuter::TestInner::test_deep` -> module.TestOuter.TestInner, then
+        # the method. pytest instantiates the INNERMOST class (nesting is just
+        # namespacing), so `cls` is the last class in the chain.
+        parts = qualname.split("::")
+        fn_name = parts[-1]
+        obj = module
+        for cls_name in parts[:-1]:
+            obj = getattr(obj, cls_name, None)
+            if obj is None or not inspect.isclass(obj):
+                raise FixtureError("class %r not found in %s" % (cls_name, file_path))
+        cls = obj
         func = getattr(cls, fn_name, None)
         if func is None:
-            raise FixtureError("method %r not found on %s" % (fn_name, cls_name))
+            raise FixtureError(
+                "method %r not found on %s" % (fn_name, "::".join(parts[:-1])))
         plans.extend(_plan_one(module, cls, fn_name, func, lookup, prefix=None))
     else:
         func = getattr(module, qualname, None)
@@ -2171,7 +2225,7 @@ def _plan_one(module, cls, fn_name, func, lookup, prefix=None):
     """
     raw = inspect.unwrap(func) if hasattr(func, "__wrapped__") else func
     marks = collect_marks(func, cls, module)
-    skip_reason, xfail = _evaluate_static_marks(marks, module)
+    skip_reason, xfail, xfail_strict = _evaluate_static_marks(marks, module)
     combos = expand_parametrize(marks)
     try:
         all_params = _signature_params(raw)
@@ -2211,7 +2265,8 @@ def _plan_one(module, cls, fn_name, func, lookup, prefix=None):
                 "func": raw, "cls": cls, "module": module,
                 "params": params, "fixture_names": fixture_names,
                 "fixture_params": fx_params,
-                "skip_reason": skip_reason, "xfail": xfail, "is_async": is_async,
+                "skip_reason": skip_reason, "xfail": xfail,
+                "xfail_strict": xfail_strict, "is_async": is_async,
             })
     return plans
 
@@ -2368,7 +2423,13 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
                     call(**kwargs)
                 duration_ms = (time.perf_counter() - start) * 1000.0
                 if plan["xfail"]:
-                    outcome, message = "xpassed", "unexpectedly passed"
+                    if plan.get("xfail_strict"):
+                        # pytest: a strict xfail that unexpectedly passes is a
+                        # failure, not an xpass.
+                        outcome = "failed"
+                        message = "[XPASS(strict)] unexpectedly passed"
+                    else:
+                        outcome, message = "xpassed", "unexpectedly passed"
             except BaseException as exc:
                 duration_ms = (time.perf_counter() - start) * 1000.0
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -2422,7 +2483,15 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
                     outcome = "error"
                     message = "teardown failed"
                     trace = tb_module.format_exc()
-            ctx.teardown(engine)
+            # Fixture (yield) teardown: a failure here turns a passing test into
+            # an error, matching pytest. A test that already failed/errored keeps
+            # its outcome (the teardown error is secondary).
+            td_err = ctx.teardown(engine)
+            if td_err is not None and outcome == "passed":
+                outcome = "error"
+                message = "fixture teardown failed: %s: %s" % (
+                    type(td_err).__name__, td_err)
+                trace = _format_traceback(td_err)
 
     emit_result(emit, batch_id, result_id, outcome, duration_ms,
                 message, trace, captured.out.value(), captured.err.value())

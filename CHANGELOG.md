@@ -56,6 +56,18 @@ flags can still change between versions.
 - **`--fixtures` and `--markers`** — list the fixtures available to a path (with
   scope, location, and docstring) or the built-in + registered markers, then exit.
 
+### Fixed
+
+Found by a new differential conformance harness (`conformance/`) that runs the
+same scenarios through tezt and pytest and diffs the verdict + exit code:
+
+- **Strict xfail** — `@mark.xfail(strict=True)` that unexpectedly passes is now
+  a `failed`, not an `xpassed` (pytest parity). xfail also honors a condition.
+- **Fixture teardown errors** — a `yield` fixture whose teardown raises now turns
+  a passing test into an `error` instead of being silently swallowed.
+- **Nested test classes** — `Test*` classes nested inside other `Test*` classes
+  are now collected (previously silently skipped).
+
 ## 0.1.0 — 2026-06-04
 
 The first working version. tezt discovers tests by parsing them in Rust (no
