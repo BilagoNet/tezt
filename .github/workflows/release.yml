@@ -29,7 +29,9 @@ jobs:
         platform:
           - { runner: ubuntu-latest, os: linux, target: x86_64, manylinux: auto }
           - { runner: ubuntu-24.04-arm, os: linux, target: aarch64, manylinux: auto }
-          - { runner: macos-13, os: macos, target: x86_64, manylinux: "" }
+          # Intel macOS is cross-built on an Apple Silicon runner — the macos-13
+          # Intel runners are slow to schedule, and maturin handles the cross.
+          - { runner: macos-latest, os: macos, target: x86_64, manylinux: "" }
           - { runner: macos-latest, os: macos, target: aarch64, manylinux: "" }
           - { runner: windows-latest, os: windows, target: x64, manylinux: "" }
     steps:
@@ -69,25 +71,29 @@ jobs:
         include:
           - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: tar.gz }
           - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: tar.gz }
-          - { runner: macos-13, target: x86_64-apple-darwin, ext: tar.gz }
+          # Intel macOS is cross-built on an Apple Silicon runner (verified
+          # locally) to avoid the slow macos-13 Intel runner queue.
+          - { runner: macos-latest, target: x86_64-apple-darwin, ext: tar.gz }
           - { runner: macos-latest, target: aarch64-apple-darwin, ext: tar.gz }
           - { runner: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
           staging="tezt-${{ matrix.target }}"
           mkdir "$staging"
           cp README.md LICENSE CHANGELOG.md "$staging"/
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/release/tezt.exe "$staging"/
+            cp "target/${{ matrix.target }}/release/tezt.exe" "$staging"/
             7z a "$staging.zip" "$staging"
           else
-            cp target/release/tezt "$staging"/
+            cp "target/${{ matrix.target }}/release/tezt" "$staging"/
             tar czf "$staging.tar.gz" "$staging"
           fi
       - uses: actions/upload-artifact@v4
