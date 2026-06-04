@@ -21,6 +21,20 @@ pub struct Cli {
     #[arg(short = 'k', value_name = "EXPR")]
     pub keyword: Option<String>,
 
+    /// Only run tests matching the given mark expression
+    /// (e.g. `slow`, `not slow`, `slow and not network`).
+    #[arg(short = 'm', value_name = "MARKEXPR")]
+    pub markers: Option<String>,
+
+    /// Re-run only the tests that failed during the last run. If no tests failed
+    /// last time (or there is no record), all tests run.
+    #[arg(long = "lf", visible_alias = "last-failed")]
+    pub last_failed: bool,
+
+    /// Run the tests that failed during the last run first, then everything else.
+    #[arg(long = "ff", visible_alias = "failed-first")]
+    pub failed_first: bool,
+
     /// Verbose output: one line per test
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,

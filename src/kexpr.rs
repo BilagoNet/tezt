@@ -1,4 +1,5 @@
-//! `-k` keyword expression evaluation, pytest-style.
+//! Boolean expression evaluation, pytest-style. Shared by `-k` (keyword
+//! substring match) and `-m` (mark set membership).
 //!
 //! Grammar:
 //!   expr  := or
@@ -6,7 +7,10 @@
 //!   and   := unary ("and" unary)*
 //!   unary := "not" unary | "(" expr ")" | TERM
 //!
-//! A TERM matches if it is a case-insensitive substring of the test id.
+//! The grammar is identical for both flags; only the meaning of a TERM differs.
+//! For `-k` a TERM matches if it is a case-insensitive substring of the test
+//! id; for `-m` a TERM matches if it is one of the item's marks. That single
+//! difference is captured by the term predicate passed to [`KExpr::eval_with`].
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
@@ -132,19 +136,33 @@ impl KExpr {
         Ok(Self { root })
     }
 
-    /// Does the given test id match the expression?
+    /// Evaluate the expression against a custom term predicate. `-k` uses
+    /// substring matching on the test id; `-m` uses exact mark-set membership.
+    ///
+    /// Keeping the boolean structure (and/or/not/parens) in one evaluator and
+    /// parameterizing only the leaf test means both flags share identical
+    /// short-circuit and precedence semantics — there is exactly one place
+    /// where `not`/`and`/`or` are interpreted.
+    pub fn eval_with<F: Fn(&str) -> bool>(&self, pred: &F) -> bool {
+        eval_pred(&self.root, pred)
+    }
+
+    /// Does the given test id match the expression? (`-k` semantics:
+    /// case-insensitive substring match of each term against the id.)
     pub fn matches(&self, test_id: &str) -> bool {
         let hay = test_id.to_lowercase();
-        eval(&self.root, &hay)
+        self.eval_with(&|term: &str| hay.contains(&term.to_lowercase()))
     }
 }
 
-fn eval(node: &Node, hay: &str) -> bool {
+/// Walk the expression tree, resolving each leaf `Term` through `pred`. The
+/// boolean operators short-circuit exactly as Python's do, matching pytest.
+fn eval_pred<F: Fn(&str) -> bool>(node: &Node, pred: &F) -> bool {
     match node {
-        Node::And(a, b) => eval(a, hay) && eval(b, hay),
-        Node::Or(a, b) => eval(a, hay) || eval(b, hay),
-        Node::Not(a) => !eval(a, hay),
-        Node::Term(t) => hay.contains(&t.to_lowercase()),
+        Node::And(a, b) => eval_pred(a, pred) && eval_pred(b, pred),
+        Node::Or(a, b) => eval_pred(a, pred) || eval_pred(b, pred),
+        Node::Not(a) => !eval_pred(a, pred),
+        Node::Term(t) => pred(t),
     }
 }
 
@@ -189,5 +207,29 @@ mod tests {
         assert!(KExpr::compile("").is_err());
         assert!(KExpr::compile("(alpha").is_err());
         assert!(KExpr::compile("alpha or").is_err());
+    }
+
+    #[test]
+    fn eval_with_set_membership() {
+        // The `-m` use: terms are mark names, matched by exact set membership
+        // rather than substring. Same grammar, different leaf predicate.
+        use std::collections::HashSet;
+        let k = KExpr::compile("slow and not net").unwrap();
+        let has = |set: &HashSet<&str>| k.eval_with(&|term: &str| set.contains(term));
+
+        let only_slow: HashSet<&str> = ["slow"].into_iter().collect();
+        assert!(has(&only_slow), "slow present, net absent => true");
+
+        let slow_and_net: HashSet<&str> = ["slow", "net"].into_iter().collect();
+        assert!(!has(&slow_and_net), "net present => `not net` is false");
+
+        // Membership is exact, not substring: "slowish" must not satisfy `slow`.
+        let slowish: HashSet<&str> = ["slowish"].into_iter().collect();
+        assert!(!has(&slowish), "exact membership, not substring");
+
+        // `not slow` against an empty set is true (no marks at all).
+        let neg = KExpr::compile("not slow").unwrap();
+        let empty: HashSet<&str> = HashSet::new();
+        assert!(neg.eval_with(&|term: &str| empty.contains(term)));
     }
 }

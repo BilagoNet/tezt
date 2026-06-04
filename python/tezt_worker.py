@@ -9,7 +9,9 @@ Pure stdlib, Python 3.8+ compatible. Single file by design.
 """
 
 import argparse
+import ast
 import asyncio
+import difflib
 import inspect
 import io
 import importlib.util
@@ -567,8 +569,11 @@ def _import_dotted(path):
 
 # ============================================================================
 # Fixture engine -- resolution, scope caches, generator teardowns.
-# Note: "class" scope is treated as module scope in v0 (documented limitation;
-# a class-scoped fixture lives until its module is torn down).
+# Scope nesting is function < class < module < session: tearing down an outer
+# scope must dispose every inner scope first. The engine keeps one cache and
+# one LIFO teardown list per non-function scope (function scope lives in a
+# per-test TestContext). Async fixtures and async tests share ONE event loop
+# (see .loop()) so async resources built in a fixture are valid in the test.
 # ============================================================================
 
 class FixtureError(Exception):
@@ -584,7 +589,26 @@ class FixtureEngine:
         self.module_cache = {}
         self.module_teardowns = []
         self.current_module_path = None
+        # class scope sits between module and function: a class-scoped fixture
+        # lives only while we are running methods of `current_class`.
+        self.class_cache = {}
+        self.class_teardowns = []
+        self.current_class = None
+        # Lazily-created event loop shared by every async fixture/test; created
+        # on first use, closed once at session teardown. See .loop().
+        self._loop = None
         # per-test (function scope) state lives in a TestContext
+
+    # -- shared event loop ---------------------------------------------------
+
+    def loop(self):
+        """Lazily-created event loop shared by all async fixtures and async
+        tests in this worker, so fixture-created async resources are valid
+        inside the test that uses them."""
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+        return self._loop
 
     # -- scope lifecycle -----------------------------------------------------
 
@@ -594,24 +618,54 @@ class FixtureEngine:
         self.teardown_module_scope()
         self.current_module_path = module_path
 
+    def switch_class(self, cls):
+        # cls may be None (a module-level function): that still tears down any
+        # live class scope, since we have left the previous class.
+        if self.current_class is cls:
+            return
+        self.teardown_class_scope()
+        self.current_class = cls
+
+    def teardown_class_scope(self):
+        self._drain(self.class_teardowns)
+        self.class_cache.clear()
+        self.current_class = None
+
     def teardown_module_scope(self):
+        # Class scope is nested inside module scope, so dispose it first.
+        self.teardown_class_scope()
         self._drain(self.module_teardowns)
         self.module_cache.clear()
         self.current_module_path = None
 
     def teardown_session_scope(self):
+        # Ordering: function (already drained per-test) < class < module <
+        # session, then close the shared loop last so async teardowns above can
+        # still run on it.
         self.teardown_module_scope()
         self._drain(self.session_teardowns)
         self.session_cache.clear()
         self.tmp_factory.cleanup()
+        if self._loop is not None:
+            try:
+                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            self._loop.close()
+            self._loop = None
+            asyncio.set_event_loop(None)
 
-    @staticmethod
-    def _drain(teardowns):
+    def _drain(self, teardowns):
+        # Drain both sync generator (next) and async generator (__anext__)
+        # fixture teardowns; async ones resume on the shared loop.
         while teardowns:
             name, gen = teardowns.pop()
             try:
-                next(gen)
-            except StopIteration:
+                if hasattr(gen, "__anext__"):           # async generator fixture
+                    self.loop().run_until_complete(gen.__anext__())
+                else:
+                    next(gen)
+            except (StopIteration, StopAsyncIteration):
                 pass
             except Exception:
                 debug("teardown of fixture %r raised:\n%s" % (name, tb_module.format_exc()))
@@ -675,22 +729,22 @@ class FixtureEngine:
     def _cache_for(self, scope, ctx):
         if scope == "session":
             return self.session_cache
-        if scope in ("module", "class"):
+        if scope == "module":
             return self.module_cache
+        if scope == "class":
+            return self.class_cache
         return ctx.cache
 
     def _teardowns_for(self, scope, ctx):
         if scope == "session":
             return self.session_teardowns
-        if scope in ("module", "class"):
+        if scope == "module":
             return self.module_teardowns
+        if scope == "class":
+            return self.class_teardowns
         return ctx.teardowns
 
     def _instantiate(self, name, func, lookup, ctx, stack):
-        if inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func):
-            raise FixtureError(
-                "async fixture %r is not supported in tezt v0 "
-                "(use a sync fixture or run async setup inside the test)" % name)
         # Resolve the fixture's own dependencies (recursive)
         kwargs = {}
         try:
@@ -700,6 +754,34 @@ class FixtureEngine:
         new_stack = stack + (name,)
         for pname in params:
             kwargs[pname] = self.resolve(pname, lookup, ctx, new_stack)
+
+        # Async fixtures run on the worker's shared loop so resources they
+        # create (connections, tasks, etc.) stay valid inside the test, which
+        # runs on the same loop.
+        if inspect.iscoroutinefunction(func):
+            try:
+                value = self.loop().run_until_complete(func(**kwargs))
+            except FixtureError:
+                raise
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise FixtureError("fixture %r raised %s: %s\n%s" % (
+                    name, type(exc).__name__, exc, _format_traceback(exc))) from exc
+            return value, None
+        if inspect.isasyncgenfunction(func):
+            agen = func(**kwargs)
+            try:
+                value = self.loop().run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                raise FixtureError("async generator fixture %r yielded no value" % name)
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise FixtureError("fixture %r raised %s: %s\n%s" % (
+                    name, type(exc).__name__, exc, _format_traceback(exc))) from exc
+            return value, agen      # teardown drains via __anext__ (handled in _drain)
+
         try:
             result = func(**kwargs)
         except FixtureError:
@@ -737,8 +819,10 @@ class TestContext:
         self.cleanup_dirs = []
         self.finalizers = []
 
-    def teardown(self):
-        FixtureEngine._drain(self.teardowns)
+    def teardown(self, engine):
+        # Drain via the engine so async-generator function-scope fixtures
+        # resume on the shared loop (engine._drain handles both kinds).
+        engine._drain(self.teardowns)
         for f in reversed(self.finalizers):
             try:
                 f()
@@ -772,40 +856,264 @@ def _signature_params(func):
 
 
 # ============================================================================
-# Assertion enrichment -- bare `assert x == y` gets source line + locals.
+# Assertion enrichment -- a bare `assert` (no explicit message) is rewritten
+# into a rich diagnostic: the source of the asserted expression plus, for a
+# side-effect-free comparison, both operand values and a type-aware diff.
+# Everything here is best-effort: any parse/eval/diff failure falls back to a
+# simpler form, and the function NEVER raises.
 # ============================================================================
 
-def _enrich_assertion(exc, exc_tb, test_file):
-    """For AssertionError with no message: 'assert failed: <line> | locals: ...'."""
-    if not isinstance(exc, AssertionError) or exc.args:
-        return None
-    target = None
-    tb = exc_tb
-    norm_file = os.path.normcase(os.path.abspath(test_file))
-    while tb is not None:           # innermost frame located in the test file
-        fname = os.path.normcase(os.path.abspath(tb.tb_frame.f_code.co_filename))
-        if fname == norm_file:
-            target = tb
-        tb = tb.tb_next
-    if target is None:
-        return None
-    frame = target.tb_frame
-    line = linecache.getline(frame.f_code.co_filename, target.tb_lineno).strip()
+# Caches keyed by filename so we parse each test file at most once. A value of
+# None means "tried and failed" (unreadable / unparseable) -- still cached so
+# we don't retry on every assertion in that file.
+_assert_src_cache = {}    # filename -> source text or None
+_assert_ast_cache = {}    # filename -> parsed ast.Module or None
+
+# ast comparison operator -> display symbol.
+_CMP_SYMBOLS = {
+    ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=",
+    ast.Gt: ">", ast.GtE: ">=", ast.In: "in", ast.NotIn: "not in",
+    ast.Is: "is", ast.IsNot: "is not",
+}
+
+_REPR_CAP = 200           # per-operand repr cap in the rich message
+_DIFF_CAP = 20            # max diff lines to show in the str diff
+
+
+def _capped_repr(value, cap=_REPR_CAP):
+    """repr() that never raises and is truncated with a trailing '...'."""
+    try:
+        r = repr(value)
+    except Exception:
+        r = "<unreprable>"
+    if len(r) > cap:
+        r = r[:cap] + "..."
+    return r
+
+
+def _source_for(filename):
+    """Read+cache a file's source text (None on any error)."""
+    if filename in _assert_src_cache:
+        return _assert_src_cache[filename]
+    src = None
+    try:
+        with open(filename, "r") as f:
+            src = f.read()
+    except Exception:
+        src = None
+    _assert_src_cache[filename] = src
+    return src
+
+
+def _ast_for(filename, source):
+    """Parse+cache a file's AST (None on any error)."""
+    if filename in _assert_ast_cache:
+        return _assert_ast_cache[filename]
+    tree = None
+    if source is not None:
+        try:
+            tree = ast.parse(source, filename)
+        except Exception:
+            tree = None
+    _assert_ast_cache[filename] = tree
+    return tree
+
+
+def _is_side_effect_free(node):
+    """True if `node` contains no call/await (safe to re-evaluate)."""
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Call, ast.Await)):
+            return False
+    return True
+
+
+def _str_diff_lines(left, right):
+    """Type-aware diff body for two strings (list of message lines)."""
+    out = []
+    # Single-line strings: pinpoint the first differing character index, which
+    # a line-based diff can't show.
+    if "\n" not in left and "\n" not in right:
+        n = min(len(left), len(right))
+        idx = None
+        for i in range(n):
+            if left[i] != right[i]:
+                idx = i
+                break
+        if idx is None and len(left) != len(right):
+            idx = n
+        if idx is not None:
+            out.append("  first difference at index %d" % idx)
+    diff = list(difflib.unified_diff(
+        left.splitlines(), right.splitlines(),
+        fromfile="left", tofile="right", lineterm=""))
+    if diff:
+        out.append("  diff (-left +right):")
+        for line in diff[:_DIFF_CAP]:
+            out.append("    " + line)
+        if len(diff) > _DIFF_CAP:
+            out.append("    ...")
+    return out
+
+
+def _seq_diff_lines(left, right):
+    """Type-aware diff body for two lists/tuples."""
+    out = []
+    if len(left) != len(right):
+        out.append("  length %d != %d" % (len(left), len(right)))
+    for i in range(min(len(left), len(right))):
+        if left[i] != right[i]:
+            out.append("  index %d: %s != %s" % (
+                i, _capped_repr(left[i]), _capped_repr(right[i])))
+            break
+    return out
+
+
+def _dict_diff_lines(left, right):
+    """Type-aware diff body for two dicts (capped to a few entries each)."""
+    out = []
+    cap = 5
+    only_left = [k for k in left if k not in right]
+    only_right = [k for k in right if k not in left]
+    if only_left:
+        out.append("  keys only in left: %s" % ", ".join(
+            _capped_repr(k, 60) for k in only_left[:cap]))
+    if only_right:
+        out.append("  keys only in right: %s" % ", ".join(
+            _capped_repr(k, 60) for k in only_right[:cap]))
+    shown = 0
+    for k in left:
+        if k in right and left[k] != right[k]:
+            out.append("  key %s: %s != %s" % (
+                _capped_repr(k, 60), _capped_repr(left[k]), _capped_repr(right[k])))
+            shown += 1
+            if shown >= cap:
+                break
+    return out
+
+
+def _set_diff_lines(left, right):
+    """Type-aware diff body for two sets/frozensets."""
+    out = []
+    only_left = left - right
+    only_right = right - left
+    if only_left:
+        out.append("  items only in left: %s" % _capped_repr(only_left))
+    if only_right:
+        out.append("  items only in right: %s" % _capped_repr(only_right))
+    return out
+
+
+def _type_aware_diff(op, left, right):
+    """Best-effort diff lines for == / != operands; [] if none/unsupported."""
+    if op not in ("==", "!="):
+        return []
+    try:
+        if isinstance(left, str) and isinstance(right, str):
+            return _str_diff_lines(left, right)
+        if (isinstance(left, (list, tuple)) and isinstance(right, (list, tuple))
+                and type(left) == type(right)):
+            return _seq_diff_lines(left, right)
+        if isinstance(left, dict) and isinstance(right, dict):
+            return _dict_diff_lines(left, right)
+        if (isinstance(left, (set, frozenset))
+                and isinstance(right, (set, frozenset))):
+            return _set_diff_lines(left, right)
+    except Exception:
+        return []
+    return []
+
+
+def _fallback_enrichment(test_src, frame):
+    """Improved version of the original behavior: header + locals summary."""
     parts = []
     for k, v in list(frame.f_locals.items())[:8]:
         if k.startswith("__"):
             continue
-        try:
-            r = repr(v)
-        except Exception:
-            r = "<unreprable>"
-        if len(r) > 120:
-            r = r[:117] + "..."
+        r = _capped_repr(v, 120)
         parts.append("%s=%s" % (k, r))
-    msg = "assert failed: %s" % (line or "<source unavailable>")
+    msg = "assert failed: %s" % (test_src or "<source unavailable>")
     if parts:
         msg += " | locals: " + ", ".join(parts)
     return msg
+
+
+def _enrich_assertion(exc, exc_tb, test_file):
+    """Build a rich message for a bare `assert` (AssertionError, no message).
+
+    Returns the message string, or None when enrichment does not apply (an
+    explicit-message AssertionError, or no usable frame). Best-effort: every
+    parse/eval/diff step is guarded so this function never raises.
+    """
+    try:
+        # Only enrich bare asserts; an explicit message is already informative.
+        if not isinstance(exc, AssertionError) or exc.args:
+            return None
+
+        # The deepest traceback frame is where the assert physically raised.
+        # We prefer it over `test_file` so an assert inside a helper still maps
+        # to the right source line.
+        tb = exc_tb if exc_tb is not None else exc.__traceback__
+        if tb is None:
+            return None
+        while tb.tb_next is not None:
+            tb = tb.tb_next
+        frame = tb.tb_frame
+        filename = frame.f_code.co_filename
+        lineno = tb.tb_lineno
+
+        source = _source_for(filename)
+        tree = _ast_for(filename, source)
+
+        # Locate the innermost ast.Assert whose line range contains `lineno`:
+        # the one with the largest starting line <= lineno.
+        node = None
+        if tree is not None:
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Assert):
+                    end = getattr(n, "end_lineno", None) or n.lineno
+                    if n.lineno <= lineno <= end:
+                        if node is None or n.lineno > node.lineno:
+                            node = n
+
+        # Source of the asserted expression (fallback: the raw source line).
+        test_src = None
+        if node is not None and source is not None:
+            try:
+                test_src = ast.get_source_segment(source, node.test)
+            except Exception:
+                test_src = None
+        if not test_src:
+            test_src = linecache.getline(filename, lineno).strip() or None
+
+        # Rich path: a single-operator comparison with side-effect-free operands.
+        if (node is not None and isinstance(node.test, ast.Compare)
+                and len(node.test.ops) == 1 and len(node.test.comparators) == 1):
+            left_node = node.test.left
+            right_node = node.test.comparators[0]
+            if _is_side_effect_free(left_node) and _is_side_effect_free(right_node):
+                try:
+                    left_val = eval(
+                        compile(ast.Expression(left_node), filename, "eval"),
+                        frame.f_globals, frame.f_locals)
+                    right_val = eval(
+                        compile(ast.Expression(right_node), filename, "eval"),
+                        frame.f_globals, frame.f_locals)
+                except BaseException:
+                    return _fallback_enrichment(test_src, frame)
+                op = _CMP_SYMBOLS.get(type(node.test.ops[0]), "?")
+                lines = [
+                    "assert %s" % (test_src or "<expr>"),
+                    "  left  = %s" % _capped_repr(left_val),
+                    "  right = %s" % _capped_repr(right_val),
+                ]
+                lines.extend(_type_aware_diff(op, left_val, right_val))
+                return "\n".join(lines)
+
+        # Fall back for anything not a safe single comparison.
+        return _fallback_enrichment(test_src, frame)
+    except Exception:
+        # Absolutely never let enrichment break result reporting.
+        return None
 
 
 def _format_traceback(exc, limit_lines=TRACEBACK_LINES):
@@ -1074,6 +1382,10 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
             # ---- setup phase (errors -> outcome "error") -------------------
             xunit.enter_module(module)
             xunit.enter_class(cls)
+            # Switch the fixture engine's class scope in lockstep with the
+            # xunit class hooks. cls may be None for a module-level function,
+            # which tears down any live class scope (we left the prior class).
+            engine.switch_class(cls)
             kwargs = dict(plan["params"])
             for name in plan["fixture_names"]:
                 kwargs[name] = engine.resolve(name, lookup, ctx, ())
@@ -1100,7 +1412,10 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
             try:
                 start = time.perf_counter()
                 if plan["is_async"]:
-                    asyncio.run(call(**kwargs))
+                    # Reuse the worker's shared loop (not asyncio.run, which
+                    # creates and closes a fresh loop each call) so async
+                    # fixtures and this test live on the same loop.
+                    engine.loop().run_until_complete(call(**kwargs))
                 else:
                     call(**kwargs)
                 duration_ms = (time.perf_counter() - start) * 1000.0
@@ -1147,7 +1462,7 @@ def run_case(plan, result_id, engine, xunit, lookup, emit, batch_id):
                     outcome = "error"
                     message = "teardown failed"
                     trace = tb_module.format_exc()
-            ctx.teardown()
+            ctx.teardown(engine)
 
     emit_result(emit, batch_id, result_id, outcome, duration_ms,
                 message, trace, captured.out.value(), captured.err.value())

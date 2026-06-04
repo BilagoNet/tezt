@@ -334,7 +334,12 @@ struct Batch {
 
 /// Group items by file and chunk into batches. File-grouping preserves
 /// module/fixture locality inside a single worker.
-fn make_batches(items: Vec<TestItem>) -> Vec<Batch> {
+///
+/// `priority_files` (the files containing a previously-failed test, for `--ff`)
+/// are scheduled first so failures surface as early as possible; within each
+/// priority class the existing "larger files first" tail-latency heuristic
+/// still applies. An empty set means no prioritization (the original order).
+fn make_batches(items: Vec<TestItem>, priority_files: &FxHashSet<PathBuf>) -> Vec<Batch> {
     let mut by_file: Vec<(PathBuf, Vec<TestItem>)> = Vec::new();
     for item in items {
         match by_file.last_mut() {
@@ -342,8 +347,12 @@ fn make_batches(items: Vec<TestItem>) -> Vec<Batch> {
             _ => by_file.push((item.file.clone(), vec![item])),
         }
     }
-    // Schedule larger files first: better tail latency on uneven suites.
-    by_file.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    by_file.sort_by(|a, b| {
+        let pa = priority_files.contains(&a.0);
+        let pb = priority_files.contains(&b.0);
+        // priority files first, then larger files first (tail-latency).
+        pb.cmp(&pa).then_with(|| b.1.len().cmp(&a.1.len()))
+    });
     let mut batches = Vec::new();
     let mut next_id = 0u64;
     for (_, file_items) in by_file {
@@ -545,6 +554,9 @@ pub struct RunConfig {
     /// Per-test wall-clock budget. When set, a watchdog kills any worker that
     /// produces no event within this long and the test is reported as an error.
     pub timeout: Option<Duration>,
+    /// Files whose batches should be scheduled first (`--ff`): those containing
+    /// a test that failed on the previous run. Empty = no prioritization.
+    pub priority_files: FxHashSet<PathBuf>,
 }
 
 pub struct RunOutput {
@@ -573,7 +585,7 @@ where
     install_signal_handler();
 
     let started = Instant::now();
-    let batches = make_batches(items);
+    let batches = make_batches(items, &cfg.priority_files);
     let n_batches = batches.len();
     if n_batches == 0 {
         return Ok(RunOutput {

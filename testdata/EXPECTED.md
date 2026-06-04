@@ -14,6 +14,7 @@ category. "collected" is the number of expanded test cases (`--collect-only`).
 | asyncio_suite | 3         | 2      | 1      | 0       | 0       | 0       | 0     | 1         |
 | failures      | 2 (+1 collection error) | 0 | 2 | 0  | 0       | 0       | 1     | 1         |
 | kfilter       | 3         | 3      | 0      | 0       | 0       | 0       | 0     | 0         |
+| marks         | 4         | 4      | 0      | 0       | 0       | 0       | 0     | 0         |
 | pytest_compat | 17        | 10     | 1      | 4       | 1       | 1       | 0     | 1         |
 | empty         | 0         | 0      | 0      | 0       | 0       | 0       | 0     | 5         |
 
@@ -69,6 +70,13 @@ failure/error, so strictly fewer than (2 failed + 1 error) are reported.
 ### kfilter/ (test_names.py)
 `test_alpha`, `test_beta`, `TestGamma::test_delta` — all pass.
 `-k alpha` → 1; `-k "alpha or beta"` → 2; `-k "not alpha"` → 2; `-k delta` → 1.
+
+### marks/ (test_marks.py)
+4 tests carrying `@tezt.mark` decorators (so the suite runs without pytest):
+`test_slow_one` (slow), `test_slow_and_net` (slow + net), `test_net_only`
+(net), `test_unmarked` (none). Marks are read statically at collection, so
+`-m` selection needs no Python import. `-m slow` → 2; `-m net` → 2;
+`-m "slow and net"` → 1; `-m "not slow"` → 2. All selected tests pass.
 
 ### pytest_compat/ (conftest.py + test_pytest_style.py + test_pytest_marked.py)
 Pure `import pytest` style; only meaningful when pytest is importable.

@@ -38,9 +38,9 @@ API, so a project that doesn't have pytest installed can still run its tests und
 
 Alpha. The core runner is stable and the test suite runs on **Linux, macOS, and Windows**
 against **CPython 3.9 through 3.14** (every push is checked across that matrix in CI). What
-isn't done yet — plugins, assertion rewriting, a few fixture scopes — is listed honestly in
-[Compatibility](#compatibility) and the [Roadmap](#roadmap). If your suite leans on the
-pytest plugin ecosystem, keep using pytest; see the [FAQ](#faq).
+isn't done yet — the plugin ecosystem, coverage, full AST assertion rewriting — is listed
+honestly in [Compatibility](#compatibility) and the [Roadmap](#roadmap). If your suite leans
+on the pytest plugin ecosystem, keep using pytest; see the [FAQ](#faq).
 
 ## Quickstart
 
@@ -121,17 +121,25 @@ where the line currently sits.
 | Works today | Not yet |
 | --- | --- |
 | `test_*.py` / `*_test.py`, `test_*` functions, `Test*` classes | The pytest plugin ecosystem (`pytest-mock`, `-django`, `-cov`, …) |
-| Fixtures: function / module / session scope, `yield` teardown, `conftest.py` chains | Assertion rewriting (pytest's per-operator introspection) |
-| `parametrize`, including stacked decorators and `ids=` | Class-scoped fixtures, async fixtures |
-| `skip` / `skipif` / `xfail` / `xpass` | Mark expressions (`-m`) |
-| `async def` tests (run on a fresh event loop each) | `--lf` / `--ff`, `pdb`, coverage |
-| xunit hooks: `setup_module`, `setup_class`, `setup_method`, and teardowns | Custom plugin hooks / `pytest_*` |
+| Fixtures: function / class / module / session scope, `yield` teardown, `conftest.py` chains | Full AST assertion rewriting (chained comparisons, call operands) |
+| `async def` tests **and** async fixtures, sharing one worker event loop | `--pdb` post-mortem, coverage integration |
+| `parametrize`, including stacked decorators and `ids=` | Custom plugin hooks / `pytest_*` |
+| Mark expressions (`-m "slow and not net"`) and `-k` name expressions | |
+| `--lf` / `--ff` (last-failed / failed-first) | |
+| Rich operator-aware assertion diffs (`==`, `!=`, `in`, lists/dicts/sets/strings) | |
+| `skip` / `skipif` / `xfail` / `xpass` | |
+| xunit hooks: `setup_module`, `setup_class`, `setup_method`, and teardowns | |
 | Builtins: `tmp_path`, `tmp_path_factory`, `monkeypatch` | |
 | Reads `@pytest.fixture` / `@pytest.mark.*`, or the zero-dep `import tezt` API | |
 
-Failures show the assertion's source line and the locals in scope, which covers most of
-what assertion rewriting gives you without the rewriting. Rich per-operator diffs are on
-the roadmap.
+When a bare `assert` fails, tezt shows an operator-aware diff: for `assert a == b` (and
+`!=`, `<`, `in`, `is`, …) it prints both operands and a type-aware diff — the differing
+index of a list, the changed key of a dict, a unified diff of two strings. It captures the
+values by re-evaluating the two sides, so when an operand contains a call (where
+re-evaluation could have side effects) it falls back to the source line plus the locals in
+scope rather than risk running your code twice. That's a deliberate trade against pytest's
+import-time AST rewriting: chained comparisons and side-effecting operands degrade to the
+plain form instead of misreporting.
 
 ## Performance
 
@@ -165,6 +173,9 @@ free.
 | Flag | Description |
 | --- | --- |
 | `-k EXPRESSION` | Run only tests whose id matches the expression (`and` / `or` / `not`, parentheses) |
+| `-m MARKEXPR` | Run only tests whose marks match the expression (e.g. `slow and not net`) |
+| `--lf` / `--last-failed` | Run only the tests that failed last run (all of them, if none did) |
+| `--ff` / `--failed-first` | Run last run's failures first, then everything else |
 | `-x` / `--maxfail N` | Stop after the first failure, or after N failures/errors |
 | `-j N` / `--jobs N` | Number of worker processes (default: CPU count) |
 | `-v` / `-q` | One line per test / summary only |
@@ -259,11 +270,9 @@ spawned.
 
 Roughly in the order it's likely to happen:
 
-- [ ] Rich assertion diffs (operator-aware), beyond source line + locals
-- [ ] Mark expressions (`-m`)
-- [ ] Class-scoped and async fixtures
-- [ ] `--lf` / `--ff` (last-failed / failed-first)
 - [ ] A plugin API, and coverage integration
+- [ ] Full AST assertion rewriting (chained comparisons, call operands)
+- [ ] `--pdb` post-mortem on failure
 
 ## FAQ
 
@@ -275,7 +284,7 @@ collection and startup savings are hard to give up; if you don't, pytest is the 
 
 **Will my existing suite run?**
 If it sticks to fixtures, `parametrize`, marks, and `conftest.py`, there's a good chance it
-runs unchanged. If it depends on plugins or on pytest's assertion rewriting, it won't yet —
+runs unchanged. If it depends on the plugin ecosystem (including coverage), it won't yet —
 the [compatibility table](#compatibility) is the honest boundary.
 
 **How is this different from karva, rtest, or maelstrom?**

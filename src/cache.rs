@@ -32,7 +32,13 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// On-disk format version. Bump when [`CachedCollection`] changes shape.
-const COLLECT_VERSION: &str = "collect-v1";
+const COLLECT_VERSION: &str = "collect-v2";
+
+/// File (under `.tezt_cache`) holding the ids that failed on the previous run.
+/// Independent of the per-file collection cache: it is a single small JSON
+/// array, lives at the cache root (not under `COLLECT_VERSION`), and powers
+/// `--lf`/`--ff`. Its own `-v1` suffix is the kill switch for its shape.
+const LASTFAILED_FILE: &str = "lastfailed-v1.json";
 
 /// Standard cache-directory tag content (see <https://bford.info/cachedir/>).
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
@@ -62,6 +68,12 @@ pub struct CachedItem {
     pub id: String,
     pub qualname: String,
     pub param_ids: Option<Vec<String>>,
+    /// Mark names for `-m` selection (see [`crate::collect::TestItem::marks`]).
+    /// `#[serde(default)]` lets pre-`marks` entries still deserialize; the
+    /// `COLLECT_VERSION` bump to `collect-v2` already invalidates them, so this
+    /// is belt-and-suspenders for any stray old file under the new shard tree.
+    #[serde(default)]
+    pub marks: Vec<String>,
 }
 
 /// A cached collection result for one file.
@@ -229,6 +241,73 @@ fn write_entry(path: &Path, entry: &CachedCollection) -> std::io::Result<()> {
     Ok(())
 }
 
+// --- last-failed record -----------------------------------------------------
+//
+// `--lf`/`--ff` need to know which test ids failed last time. This is kept
+// deliberately separate from the per-file collection cache: it must work even
+// when that cache is disabled (`--no-cache`), it is a single tiny file rather
+// than one entry per source file, and its lifecycle (merge-update after every
+// run) is unrelated to file-freshness invalidation.
+
+/// Absolute path of the last-failed record under `<rootdir>/.tezt_cache`.
+fn last_failed_path(rootdir: &Path) -> PathBuf {
+    rootdir.join(".tezt_cache").join(LASTFAILED_FILE)
+}
+
+/// Load the set of test ids recorded as failing on the previous run. Any
+/// missing/corrupt file yields an empty set (never an error): a damaged record
+/// must never break `--lf`/`--ff`, it just degrades to "no history".
+pub fn load_last_failed(rootdir: &Path) -> rustc_hash::FxHashSet<String> {
+    let path = last_failed_path(rootdir);
+    let Ok(bytes) = fs_err::read(&path) else {
+        return rustc_hash::FxHashSet::default();
+    };
+    // Stored as a plain JSON array of ids; collect into the set we hand out.
+    match serde_json::from_slice::<Vec<String>>(&bytes) {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(_) => rustc_hash::FxHashSet::default(),
+    }
+}
+
+/// Persist the set of currently-failing test ids under `.tezt_cache`,
+/// best-effort (errors are ignored; the cache must never fail a run). Writes a
+/// sorted JSON array atomically (tempfile + rename), creating `.tezt_cache`
+/// (with its `CACHEDIR.TAG`/`.gitignore` via [`init_cache_dir`]) if needed.
+///
+/// The array is sorted so the on-disk file is stable across runs that fail the
+/// same set (nicer diffs, reproducible bytes); order is irrelevant on load.
+pub fn save_last_failed(rootdir: &Path, ids: &rustc_hash::FxHashSet<String>) {
+    let cache_dir = rootdir.join(".tezt_cache");
+    // Ensure the cache dir + marker files exist; bail quietly if we can't make
+    // it (e.g. read-only fs) — the record is purely an optimization.
+    if init_cache_dir(&cache_dir).is_err() {
+        return;
+    }
+    let mut sorted: Vec<&String> = ids.iter().collect();
+    sorted.sort();
+    let _ = write_last_failed(&cache_dir.join(LASTFAILED_FILE), &sorted);
+}
+
+/// Serialize the sorted id list and write it atomically (same tempfile +
+/// rename pattern as [`write_entry`], so a crash never leaves a half-written
+/// record). Reports IO/serialization errors to the caller, which ignores them.
+fn write_last_failed(path: &Path, ids: &[&String]) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "record has no parent")
+    })?;
+    fs_err::create_dir_all(dir)?;
+    let bytes = serde_json::to_vec(ids)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    {
+        use std::io::Write as _;
+        tmp.write_all(&bytes)?;
+        tmp.flush()?;
+    }
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,11 +331,13 @@ mod tests {
                     id: "test_a.py::test_one".into(),
                     qualname: "test_one".into(),
                     param_ids: None,
+                    marks: vec![],
                 },
                 CachedItem {
                     id: "test_a.py::TestC::test_two".into(),
                     qualname: "TestC::test_two".into(),
                     param_ids: Some(vec!["1".into(), "2".into()]),
+                    marks: vec!["slow".into()],
                 },
             ],
             dynamic: false,
@@ -405,9 +486,63 @@ mod tests {
             id: "testdata/test_h.py::TestK::test_s".into(),
             qualname: "TestK::test_s".into(),
             param_ids: Some(vec!["a".into(), "b-c".into()]),
+            marks: vec!["slow".into(), "net".into()],
         };
         let json = serde_json::to_string(&item).unwrap();
         let back: CachedItem = serde_json::from_str(&json).unwrap();
         assert_eq!(item, back);
+    }
+
+    #[test]
+    fn cached_item_marks_default_when_absent() {
+        // Old entries (pre-`marks`) must still deserialize via `#[serde(default)]`.
+        let json = r#"{"id":"f.py::test_a","qualname":"test_a","param_ids":null}"#;
+        let back: CachedItem = serde_json::from_str(json).unwrap();
+        assert!(back.marks.is_empty());
+    }
+
+    #[test]
+    fn last_failed_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ids = rustc_hash::FxHashSet::default();
+        ids.insert("test_a.py::test_one".to_string());
+        ids.insert("test_a.py::test_two[1]".to_string());
+
+        save_last_failed(dir.path(), &ids);
+        let back = load_last_failed(dir.path());
+        assert_eq!(back, ids);
+        // The record lives at the cache root, beside CACHEDIR.TAG.
+        assert!(dir
+            .path()
+            .join(".tezt_cache")
+            .join(LASTFAILED_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn last_failed_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // No cache dir at all => empty set, no error.
+        assert!(load_last_failed(dir.path()).is_empty());
+
+        // A corrupt record also degrades to empty rather than erroring.
+        let cache_dir = dir.path().join(".tezt_cache");
+        fs_err::create_dir_all(&cache_dir).unwrap();
+        fs_err::write(cache_dir.join(LASTFAILED_FILE), b"not json").unwrap();
+        assert!(load_last_failed(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn save_last_failed_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let first: rustc_hash::FxHashSet<String> = ["a::test_x".to_string()].into_iter().collect();
+        save_last_failed(dir.path(), &first);
+
+        let second: rustc_hash::FxHashSet<String> =
+            ["b::test_y".to_string(), "b::test_z".to_string()]
+                .into_iter()
+                .collect();
+        save_last_failed(dir.path(), &second);
+        assert_eq!(load_last_failed(dir.path()), second);
     }
 }

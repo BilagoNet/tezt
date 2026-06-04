@@ -200,10 +200,12 @@ def test_core(root):
 
     fe = r["core::test_fail_enriched"]
     check(fe["outcome"] == "failed", "bare assert -> failed")
-    check(fe["message"] and "assert failed:" in fe["message"]
-          and "a == b" in fe["message"] and "a=1" in fe["message"]
-          and "b=2" in fe["message"],
-          "assertion enrichment has source + locals", repr(fe["message"]))
+    # Rich operator-aware enrichment: the asserted expression plus both
+    # operand values (a=1, b=2 are side-effect-free, so the safe path fires).
+    check(fe["message"] and "assert a == b" in fe["message"]
+          and "left" in fe["message"] and "right" in fe["message"]
+          and "= 1" in fe["message"] and "= 2" in fe["message"],
+          "assertion enrichment shows operands", repr(fe["message"]))
     check(fe["traceback"] is not None, "failed has traceback")
 
     check(r["core::test_fail_msg"]["outcome"] == "failed"
@@ -721,7 +723,7 @@ def test_pytest_compat(root):
 
 
 # ============================================================================
-# Suite 5: --no-capture, truncation, async fixture rejection, edge protocol
+# Suite 5: --no-capture, truncation, async fixture support, edge protocol
 # ============================================================================
 
 def test_misc(root):
@@ -741,7 +743,7 @@ def test_misc(root):
                 return 1
 
             def test_async_fixture(afix):
-                pass
+                assert afix == 1
 
             @tezt.fixture
             def cyc_a(cyc_b):
@@ -778,9 +780,9 @@ def test_misc(root):
     r = by_id(results)
     check(len(r["t1"]["stdout"]) < 70 * 1024 and "[truncated]" in r["t1"]["stdout"],
           "stdout truncated at 64KB")
-    check(r["t2"]["outcome"] == "error"
-          and "async fixture" in (r["t2"]["message"] or ""),
-          "async fixture -> clear error", repr(r["t2"].get("message")))
+    # Async fixtures are now supported (run on the worker's shared loop).
+    check(r["t2"]["outcome"] == "passed",
+          "async coroutine fixture resolves", repr(r["t2"].get("message")))
     check(r["t3"]["outcome"] == "error"
           and "cycle" in (r["t3"]["message"] or ""),
           "fixture dependency cycle detected", repr(r["t3"].get("message")))
@@ -789,7 +791,168 @@ def test_misc(root):
 
 
 # ============================================================================
-# Suite 6: performance -- 2000 trivial tests through one worker
+# Suite 6: class-scoped fixtures, async fixtures (coroutine + async-gen
+# teardown), async test regression, and rich operator-aware assertion diffs.
+# ============================================================================
+
+def test_class_async_assert(root):
+    print("\n[class-scope fixtures / async fixtures / assertion diffs]")
+    # Sentinel path the async-gen fixture's teardown writes to; embed it into
+    # the generated module as a string literal so the fixture closure can see
+    # it without any import machinery.
+    sentinel = os.path.join(root, "torndown")
+
+    write_suite(root, {
+        "test_clsfix.py": """
+            import tezt
+
+            BUILDS = []          # one entry per class-scoped fixture build
+
+            @tezt.fixture(scope="class")
+            def cval():
+                BUILDS.append(1)
+                return len(BUILDS)      # 1 for the first class, 2 for the next
+
+            class TestA:
+                def test_a1(self, cval):
+                    assert cval == 1     # built once for this class
+                def test_a2(self, cval):
+                    assert cval == 1     # cached within the class
+
+            class TestB:
+                def test_b1(self, cval):
+                    assert cval == 2     # rebuilt for a new class
+        """,
+        "test_asyncfix.py": """
+            import os, tezt
+
+            SENTINEL = %r
+
+            @tezt.fixture
+            async def af():
+                return 41
+
+            def test_af(af):
+                assert af == 41
+
+            @tezt.fixture
+            async def agen():
+                yield 7
+                # teardown on the shared loop writes a sentinel file
+                open(SENTINEL, "w").write("1")
+
+            def test_agen(agen):
+                assert agen == 7
+
+            async def test_async_regression():
+                assert True
+        """ % (sentinel,),
+        "test_diffs.py": """
+            def test_list_diff():
+                assert [1, 2, 3] == [1, 2, 4]
+
+            def test_dict_diff():
+                assert {'a': 1, 'b': 2} == {'a': 1, 'b': 3}
+
+            def test_str_diff():
+                assert 'hello world' == 'hello there'
+
+            def test_int_diff():
+                x = 5
+                y = 6
+                assert x == y
+
+            def test_call_operand():
+                items = [1, 2]
+                assert len(items) == 3
+        """,
+    })
+
+    # ---- (1) class-scoped fixture: one build per class -------------------
+    w = Worker(root)
+    fcls = os.path.join(root, "test_clsfix.py")
+    results, _ = w.run([
+        {"id": "ca1", "file": fcls, "qualname": "TestA::test_a1"},
+        {"id": "ca2", "file": fcls, "qualname": "TestA::test_a2"},
+        {"id": "cb1", "file": fcls, "qualname": "TestB::test_b1"},
+    ])
+    r = by_id(results)
+    check(r["ca1"]["outcome"] == "passed", "class fixture built once (cval==1)",
+          repr(r["ca1"].get("message")))
+    check(r["ca2"]["outcome"] == "passed", "class fixture cached within class",
+          repr(r["ca2"].get("message")))
+    check(r["cb1"]["outcome"] == "passed", "class fixture rebuilt for next class",
+          repr(r["cb1"].get("message")))
+
+    # ---- (2)+(3)+(4) async coroutine fixture, async-gen teardown, async test
+    fas = os.path.join(root, "test_asyncfix.py")
+    results, _ = w.run([
+        {"id": "af", "file": fas, "qualname": "test_af"},
+        {"id": "agen", "file": fas, "qualname": "test_agen"},
+        {"id": "areg", "file": fas, "qualname": "test_async_regression"},
+    ])
+    r = by_id(results)
+    check(r["af"]["outcome"] == "passed", "async coroutine fixture value (41)",
+          repr(r["af"].get("message")))
+    check(r["agen"]["outcome"] == "passed", "async-generator fixture yields value",
+          repr(r["agen"].get("message")))
+    check(r["areg"]["outcome"] == "passed", "async test still works (regression)",
+          repr(r["areg"].get("message")))
+    # The async-gen teardown only runs when the worker disposes scope. The
+    # fixture is function-scoped, so it tears down right after test_agen.
+    check(os.path.exists(sentinel),
+          "async-generator fixture teardown ran on shared loop")
+
+    # ---- (5) rich operator-aware assertion diffs --------------------------
+    fd = os.path.join(root, "test_diffs.py")
+    results, _ = w.run([
+        {"id": "d_list", "file": fd, "qualname": "test_list_diff"},
+        {"id": "d_dict", "file": fd, "qualname": "test_dict_diff"},
+        {"id": "d_str", "file": fd, "qualname": "test_str_diff"},
+        {"id": "d_int", "file": fd, "qualname": "test_int_diff"},
+        {"id": "d_call", "file": fd, "qualname": "test_call_operand"},
+    ])
+    r = by_id(results)
+
+    dl = r["d_list"]
+    check(dl["outcome"] == "failed", "list diff -> failed")
+    check(dl["message"] and "left" in dl["message"] and "right" in dl["message"]
+          and "index 2" in dl["message"],
+          "list diff reports first differing index", repr(dl["message"]))
+
+    dd = r["d_dict"]
+    check(dd["outcome"] == "failed", "dict diff -> failed")
+    check(dd["message"] and "left" in dd["message"] and "right" in dd["message"]
+          and "'b'" in dd["message"] and "2" in dd["message"] and "3" in dd["message"],
+          "dict diff reports differing key/values", repr(dd["message"]))
+
+    ds = r["d_str"]
+    check(ds["outcome"] == "failed", "str diff -> failed")
+    check(ds["message"] and "left" in ds["message"] and "right" in ds["message"]
+          and ("diff" in ds["message"] or "index" in ds["message"]),
+          "str diff shows unified diff / first index", repr(ds["message"]))
+
+    di = r["d_int"]
+    check(di["outcome"] == "failed", "int var diff -> failed")
+    check(di["message"] and "assert x == y" in di["message"]
+          and "= 5" in di["message"] and "= 6" in di["message"],
+          "int operand values shown", repr(di["message"]))
+
+    # Call operand: safe path is skipped (has a Call) -> fallback form, but
+    # must not crash and must still mention the source.
+    dc = r["d_call"]
+    check(dc["outcome"] == "failed", "call-operand assert -> failed")
+    check(dc["message"] and "assert failed:" in dc["message"]
+          and "len(items) == 3" in dc["message"],
+          "call operand falls back without crashing", repr(dc["message"]))
+
+    ev, rc = w.shutdown()
+    check(ev.get("event") == "bye" and rc == 0,
+          "class/async/diff worker clean shutdown")
+
+
+# ============================================================================
+# Suite 7: performance -- 2000 trivial tests through one worker
 # ============================================================================
 
 def test_perf(root):
@@ -832,7 +995,7 @@ def test_perf(root):
 
 def main():
     suites = [test_core, test_fixtures, test_classes_async_discovery,
-              test_pytest_compat, test_misc]
+              test_pytest_compat, test_misc, test_class_async_assert]
     per_test_ms = None
     for fn in suites:
         root = tempfile.mkdtemp(prefix="tezt-selftest-")

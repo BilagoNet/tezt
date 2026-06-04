@@ -26,6 +26,12 @@ pub struct TestItem {
     /// `None` = not parametrized; `Some(vec![])` = parametrized but case ids
     /// could not be determined statically.
     pub param_ids: Option<Vec<String>>,
+    /// Mark names attached to this test (from `@pytest.mark.X` / `@tezt.mark.X`
+    /// decorators plus module- and class-level `pytestmark`/`teztmark`),
+    /// deduplicated. Used by `-m` selection. `parametrize` is intentionally
+    /// excluded (it is structural, not a selection mark). Empty for items from
+    /// files that could not be parsed statically.
+    pub marks: Vec<String>,
 }
 
 impl TestItem {
@@ -217,6 +223,9 @@ fn parse_file(source: &str, abs: &Path, rel: &str) -> CollectedFile {
                     file: abs.to_path_buf(),
                     qualname: "*".to_string(),
                     param_ids: None,
+                    // No AST to read marks from; `-m` can never select a file we
+                    // could not parse. (`--lf`/`--ff` still match it by path.)
+                    marks: Vec::new(),
                 }],
                 file: abs.to_path_buf(),
                 rel: rel.to_string(),
@@ -225,28 +234,36 @@ fn parse_file(source: &str, abs: &Path, rel: &str) -> CollectedFile {
         }
     };
 
+    // Module-level `pytestmark`/`teztmark` applies to every test in the file.
+    // Computed once; folded into each item's marks below.
+    let module_marks = pytestmark_assignments(&body);
+
     let mut items = Vec::new();
     for stmt in &body {
         match stmt {
             ast::Stmt::FunctionDef(f) if f.name.as_str().starts_with("test") => {
                 if is_test_name(f.name.as_str()) {
+                    let marks = combine_marks(decorator_marks(&f.decorator_list), &module_marks);
                     items.push(make_item(
                         rel,
                         abs,
                         f.name.as_str(),
                         None,
                         &f.decorator_list,
+                        marks,
                     ));
                 }
             }
             ast::Stmt::AsyncFunctionDef(f) => {
                 if is_test_name(f.name.as_str()) {
+                    let marks = combine_marks(decorator_marks(&f.decorator_list), &module_marks);
                     items.push(make_item(
                         rel,
                         abs,
                         f.name.as_str(),
                         None,
                         &f.decorator_list,
+                        marks,
                     ));
                 }
             }
@@ -254,24 +271,36 @@ fn parse_file(source: &str, abs: &Path, rel: &str) -> CollectedFile {
                 if class_has_init(c) {
                     continue; // pytest skips Test* classes with __init__
                 }
+                // Class-level marks = class decorators + class-body
+                // `pytestmark`/`teztmark` + the module-level marks. Each method
+                // inherits these and adds its own decorator marks.
+                let mut class_marks = decorator_marks(&c.decorator_list);
+                push_unique(&mut class_marks, pytestmark_assignments(&c.body));
+                push_unique(&mut class_marks, module_marks.clone());
                 for sub in &c.body {
                     match sub {
                         ast::Stmt::FunctionDef(m) if is_test_name(m.name.as_str()) => {
+                            let marks =
+                                combine_marks(decorator_marks(&m.decorator_list), &class_marks);
                             items.push(make_item(
                                 rel,
                                 abs,
                                 m.name.as_str(),
                                 Some(c.name.as_str()),
                                 &m.decorator_list,
+                                marks,
                             ));
                         }
                         ast::Stmt::AsyncFunctionDef(m) if is_test_name(m.name.as_str()) => {
+                            let marks =
+                                combine_marks(decorator_marks(&m.decorator_list), &class_marks);
                             items.push(make_item(
                                 rel,
                                 abs,
                                 m.name.as_str(),
                                 Some(c.name.as_str()),
                                 &m.decorator_list,
+                                marks,
                             ));
                         }
                         _ => {}
@@ -302,6 +331,7 @@ fn from_cache(hit: CachedCollection, abs: &Path, rel: &str) -> CollectedFile {
             file: abs.to_path_buf(),
             qualname: c.qualname,
             param_ids: c.param_ids,
+            marks: c.marks,
         })
         .collect();
     CollectedFile {
@@ -322,6 +352,7 @@ fn to_cache(collected: &CollectedFile, key: crate::cache::FileCacheKey) -> Cache
             id: i.id.clone(),
             qualname: i.qualname.clone(),
             param_ids: i.param_ids.clone(),
+            marks: i.marks.clone(),
         })
         .collect();
     CachedCollection {
@@ -348,6 +379,7 @@ fn make_item(
     func: &str,
     class: Option<&str>,
     decorators: &[ast::Expr],
+    marks: Vec<String>,
 ) -> TestItem {
     let qualname = match class {
         Some(c) => format!("{c}::{func}"),
@@ -360,7 +392,118 @@ fn make_item(
         file: abs.to_path_buf(),
         qualname,
         param_ids,
+        marks,
     }
+}
+
+// --- static mark extraction (best effort) -----------------------------------
+//
+// pytest's `-m` selects on *marks*. We collect them statically from the AST —
+// no Python import — from three sources, matching pytest's own precedence-free
+// union: `@pytest.mark.X` / `@tezt.mark.X` decorators on the test, and
+// `pytestmark`/`teztmark` assignments at module and class scope. `parametrize`
+// is filtered out everywhere: it is a structural decorator, not a selection
+// mark (pytest does not let you `-m parametrize`).
+
+/// Extract the mark name from a decorator expression: matches
+/// `<anything>.mark.NAME`, `<anything>.mark.NAME(...)`, or `mark.NAME` /
+/// `mark.NAME(...)`. Returns None for non-mark decorators. `parametrize` is
+/// filtered out by the caller.
+fn decorator_mark_name(dec: &ast::Expr) -> Option<String> {
+    // A bare `@pytest.mark.slow` is an Attribute; `@pytest.mark.slow(...)` is a
+    // Call whose `func` is that Attribute. Unwrap the call to its callee first.
+    let callee = if let ast::Expr::Call(c) = dec {
+        c.func.as_ref()
+    } else {
+        dec
+    };
+    // We want the final `.NAME` of a `....mark.NAME` chain. So `callee` must be
+    // an Attribute (`.NAME`) whose `.value` is itself the `....mark` part.
+    if let ast::Expr::Attribute(a) = callee {
+        // The thing being attribute-accessed must be `mark`: either the tail of
+        // a dotted path (`pytest.mark` => Attribute with attr == "mark") or a
+        // bare imported `mark` name (`from pytest import mark` => Name "mark").
+        let is_mark = match a.value.as_ref() {
+            ast::Expr::Attribute(inner) => inner.attr.as_str() == "mark",
+            ast::Expr::Name(n) => n.id.as_str() == "mark",
+            _ => false,
+        };
+        if is_mark {
+            return Some(a.attr.to_string());
+        }
+    }
+    None
+}
+
+/// All mark names on a decorator list (excludes `parametrize`).
+fn decorator_marks(decorators: &[ast::Expr]) -> Vec<String> {
+    decorators
+        .iter()
+        .filter_map(decorator_mark_name)
+        .filter(|m| m != "parametrize")
+        .collect()
+}
+
+/// Mark names from a `pytestmark`/`teztmark` assignment value: a single mark
+/// expr (`pytest.mark.X` / `pytest.mark.X(...)`), or a list/tuple of them.
+fn mark_names_from_value(expr: &ast::Expr) -> Vec<String> {
+    let names: Vec<String> = match expr {
+        // `pytestmark = [pytest.mark.a, pytest.mark.b]` (or a tuple).
+        ast::Expr::List(l) => l.elts.iter().filter_map(decorator_mark_name).collect(),
+        ast::Expr::Tuple(t) => t.elts.iter().filter_map(decorator_mark_name).collect(),
+        // `pytestmark = pytest.mark.a` — a single mark.
+        other => decorator_mark_name(other).into_iter().collect(),
+    };
+    names.into_iter().filter(|m| m != "parametrize").collect()
+}
+
+/// Scan a statement body for top-of-scope `pytestmark`/`teztmark = ...`
+/// assignments and return the mark names they contribute. Handles both
+/// `Assign` (targets contain a `Name`) and `AnnAssign` (target is a `Name`).
+fn pytestmark_assignments(body: &[ast::Stmt]) -> Vec<String> {
+    let mut marks = Vec::new();
+    for stmt in body {
+        match stmt {
+            ast::Stmt::Assign(a) => {
+                let is_pytestmark = a.targets.iter().any(is_pytestmark_name);
+                if is_pytestmark {
+                    push_unique(&mut marks, mark_names_from_value(&a.value));
+                }
+            }
+            ast::Stmt::AnnAssign(a) => {
+                if is_pytestmark_name(&a.target) {
+                    if let Some(v) = &a.value {
+                        push_unique(&mut marks, mark_names_from_value(v));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    marks
+}
+
+/// Is `expr` a `Name` equal to `pytestmark` or `teztmark`?
+fn is_pytestmark_name(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Name(n) if n.id.as_str() == "pytestmark" || n.id.as_str() == "teztmark")
+}
+
+/// Append `extra` onto `marks`, skipping any name already present
+/// (order-preserving dedup — first occurrence wins, so a test's own decorator
+/// marks keep their position ahead of inherited ones).
+fn push_unique(marks: &mut Vec<String>, extra: Vec<String>) {
+    for m in extra {
+        if !marks.contains(&m) {
+            marks.push(m);
+        }
+    }
+}
+
+/// Combine a test's own (decorator) marks with inherited (class/module) marks,
+/// deduplicated and preserving first-seen order.
+fn combine_marks(mut own: Vec<String>, inherited: &[String]) -> Vec<String> {
+    push_unique(&mut own, inherited.to_vec());
+    own
 }
 
 // --- static parametrize expansion (best effort, literals only) -------------
@@ -692,6 +835,124 @@ def test_d(x):
             ids.contains(&"TestBox::test_inner".to_string()),
             "got {ids:?}"
         );
+    }
+
+    /// Look up a collected item's marks by qualname (test convenience).
+    fn marks_of<'a>(c: &'a CollectedFile, qualname: &str) -> &'a [String] {
+        &c.items
+            .iter()
+            .find(|i| i.qualname == qualname)
+            .unwrap_or_else(|| panic!("no item {qualname}; have {:?}", c.items))
+            .marks
+    }
+
+    #[test]
+    fn marks_from_decorators() {
+        // `@pytest.mark.X`, `@tezt.mark.X`, and the call form all contribute;
+        // `parametrize` never does.
+        let c = collect_src(
+            r#"
+import pytest, tezt
+
+@pytest.mark.slow
+@tezt.mark.network
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("x", [1, 2])
+def test_a(x):
+    assert x
+
+def test_plain():
+    assert True
+"#,
+        );
+        assert_eq!(marks_of(&c, "test_a"), &["slow", "network", "timeout"]);
+        assert!(marks_of(&c, "test_plain").is_empty());
+    }
+
+    #[test]
+    fn marks_from_module_level_pytestmark() {
+        // Module-level `pytestmark` (single, list, and the `teztmark` alias)
+        // applies to every test; an annotated assignment works too.
+        let c = collect_src(
+            r#"
+import pytest
+
+pytestmark = [pytest.mark.slow, pytest.mark.network]
+
+def test_a():
+    assert True
+
+@pytest.mark.extra
+def test_b():
+    assert True
+"#,
+        );
+        assert_eq!(marks_of(&c, "test_a"), &["slow", "network"]);
+        // Own decorator marks come first, then inherited module marks.
+        assert_eq!(marks_of(&c, "test_b"), &["extra", "slow", "network"]);
+
+        let single = collect_src(
+            r#"
+import tezt
+teztmark = tezt.mark.slow
+def test_x():
+    assert True
+"#,
+        );
+        assert_eq!(marks_of(&single, "test_x"), &["slow"]);
+
+        let annotated = collect_src(
+            r#"
+import pytest
+pytestmark: list = pytest.mark.slow
+def test_y():
+    assert True
+"#,
+        );
+        assert_eq!(marks_of(&annotated, "test_y"), &["slow"]);
+    }
+
+    #[test]
+    fn marks_from_class_level() {
+        // Class decorators + class-body `pytestmark` + module marks all flow
+        // down to methods, combined with each method's own decorator marks and
+        // deduplicated (no duplicate `slow`).
+        let c = collect_src(
+            r#"
+import pytest
+
+pytestmark = pytest.mark.modwide
+
+@pytest.mark.slow
+class TestThing:
+    pytestmark = [pytest.mark.classwide, pytest.mark.slow]
+
+    @pytest.mark.fast
+    def test_m(self):
+        assert True
+
+    def test_n(self):
+        assert True
+"#,
+        );
+        // test_m: own (fast) + class decorator (slow) + class body
+        // (classwide, slow-deduped) + module (modwide).
+        assert_eq!(
+            marks_of(&c, "TestThing::test_m"),
+            &["fast", "slow", "classwide", "modwide"]
+        );
+        assert_eq!(
+            marks_of(&c, "TestThing::test_n"),
+            &["slow", "classwide", "modwide"]
+        );
+    }
+
+    #[test]
+    fn dynamic_file_has_empty_marks() {
+        // An unparseable file degrades to one dynamic item with no marks.
+        let c = collect_src("def test_broken(:\n    pass\n");
+        assert!(c.dynamic);
+        assert!(c.items[0].marks.is_empty());
     }
 
     #[test]

@@ -383,3 +383,220 @@ fn collection_cache_is_transparent_across_runs() {
         "a warm run should have populated .tezt_cache"
     );
 }
+
+// ---------------------------------------------------------------------------
+// -m mark expressions (testdata/marks)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn marks_suite_all_pass_without_filter() {
+    tezt("marks")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("4 passed"));
+}
+
+#[test]
+fn m_filter_selects_by_single_mark() {
+    // `slow` is on test_slow_one and test_slow_and_net.
+    tezt("marks")
+        .arg("-m")
+        .arg("slow")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("2 passed"))
+        .stdout(predicate::str::contains("2 deselected"));
+}
+
+#[test]
+fn m_filter_boolean_and() {
+    // Only test_slow_and_net carries both marks.
+    tezt("marks")
+        .arg("-m")
+        .arg("slow and net")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("1 passed"))
+        .stdout(predicate::str::contains("3 deselected"));
+}
+
+#[test]
+fn m_filter_not_excludes_marked() {
+    // not slow => test_net_only + test_unmarked.
+    tezt("marks")
+        .arg("-m")
+        .arg("not slow")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("2 passed"))
+        .stdout(predicate::str::contains("2 deselected"));
+}
+
+#[test]
+fn m_filter_collect_only_lists_only_selected() {
+    tezt("marks")
+        .arg("-m")
+        .arg("net")
+        .arg("--collect-only")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("test_slow_and_net"))
+        .stdout(predicate::str::contains("test_net_only"))
+        .stdout(predicate::str::contains("test_unmarked").not())
+        .stdout(predicate::str::contains("2 deselected"));
+}
+
+// ---------------------------------------------------------------------------
+// Rich assertion diffs (operator-aware) — exercised end-to-end through the
+// real worker, so this also proves the Rust<->Python wiring carries the
+// enriched message into the failure report.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn assertion_diff_shows_both_operands_and_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_diff.py"),
+        "def test_list_diff():\n    assert [1, 2, 3] == [1, 2, 4]\n",
+    )
+    .expect("write test");
+
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(dir.path());
+    cmd.assert()
+        .code(1)
+        .stdout(predicate::str::contains("left"))
+        .stdout(predicate::str::contains("right"))
+        .stdout(predicate::str::contains("index 2"));
+}
+
+// ---------------------------------------------------------------------------
+// --lf / --ff (last-failed / failed-first). These are stateful: each writes
+// the failing-test record into the run's .tezt_cache, so they use an isolated
+// temp working directory and run the binary twice.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn last_failed_reruns_only_previous_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_a.py"),
+        "def test_ok():\n    assert True\n\ndef test_bad():\n    assert False\n",
+    )
+    .expect("write a");
+    std::fs::write(
+        dir.path().join("test_b.py"),
+        "def test_ok2():\n    assert True\n",
+    )
+    .expect("write b");
+
+    // Run 1: full run records the one failure.
+    let mut first = Command::cargo_bin("tezt").expect("tezt binary should build");
+    first
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    first
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("2 passed"))
+        .stdout(predicate::str::contains("1 failed"));
+
+    // Run 2: --lf collects only the previously-failed test.
+    let mut second = Command::cargo_bin("tezt").expect("tezt binary should build");
+    second
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--lf")
+        .arg(".");
+    second
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("collected 1 tests"))
+        .stdout(predicate::str::contains("1 failed"));
+}
+
+#[test]
+fn last_failed_with_no_history_runs_all() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("test_ok.py"),
+        "def test_one():\n    assert True\n\ndef test_two():\n    assert True\n",
+    )
+    .expect("write");
+
+    // No prior run => no record => --lf must fall back to running everything.
+    let mut cmd = Command::cargo_bin("tezt").expect("tezt binary should build");
+    cmd.current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("--lf")
+        .arg(".");
+    cmd.assert()
+        .code(0)
+        .stdout(predicate::str::contains("2 passed"));
+}
+
+#[test]
+fn failed_first_schedules_failures_before_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Alphabetically test_afail < test_zlast, but failed-first ordering is by
+    // previous failure, not name, so the failing file must run first.
+    std::fs::write(
+        dir.path().join("test_zlast.py"),
+        "def test_z():\n    assert True\n",
+    )
+    .expect("write z");
+    std::fs::write(
+        dir.path().join("test_afail.py"),
+        "def test_fails():\n    assert False\n",
+    )
+    .expect("write a");
+
+    // Run 1 records the failure.
+    let mut first = Command::cargo_bin("tezt").expect("tezt binary should build");
+    first
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg(".");
+    first.assert().code(1);
+
+    // Run 2: --ff with a single worker => sequential output; the failing test
+    // must appear before the passing one, and nothing is deselected.
+    let out = Command::cargo_bin("tezt")
+        .expect("tezt binary should build")
+        .current_dir(dir.path())
+        .env("TEZT_PYTHON", test_python())
+        .arg("--color")
+        .arg("never")
+        .arg("-j")
+        .arg("1")
+        .arg("-v")
+        .arg("--ff")
+        .arg(".")
+        .output()
+        .expect("run tezt --ff");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fail_pos = stdout
+        .find("test_fails")
+        .expect("failing test in -v output");
+    let pass_pos = stdout.find("test_z").expect("passing test in -v output");
+    assert!(
+        fail_pos < pass_pos,
+        "--ff should run the previously-failed test first:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("collected 2 tests"),
+        "--ff must not deselect anything:\n{stdout}"
+    );
+}

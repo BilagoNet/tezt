@@ -16,6 +16,7 @@ mod runner;
 
 use anyhow::Result;
 use clap::Parser;
+use rustc_hash::FxHashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -58,6 +59,15 @@ fn run() -> Result<i32> {
         None => None,
     };
 
+    // -m mark expression: same boolean engine as -k, but each term is matched
+    // against an item's mark set rather than a substring of its id.
+    let mexpr = match &args.markers {
+        Some(e) => Some(
+            kexpr::KExpr::compile(e).map_err(|e| anyhow::anyhow!("invalid -m expression: {e}"))?,
+        ),
+        None => None,
+    };
+
     // --- collection ---------------------------------------------------------
     // Persistent collection cache: unchanged files skip read+parse on warm
     // runs. `--clear-cache` wipes it first (best-effort); `--no-cache` disables
@@ -76,19 +86,61 @@ fn run() -> Result<i32> {
     let mut items: Vec<collect::TestItem> =
         collected_files.into_iter().flat_map(|f| f.items).collect();
 
+    // Baseline case count *before* any selection, so `deselected` reflects the
+    // combined effect of -k, -m, and --lf (recomputed once, below).
+    let before_total: usize = items.iter().map(|i| i.expected_cases()).sum();
+
     // Apply -k: keep an item if its base id or any statically-known case id
     // matches. (Parametrized cases are re-filtered on results below.)
-    let mut deselected = 0usize;
     if let Some(k) = &kexpr {
-        let before: usize = items.iter().map(|i| i.expected_cases()).sum();
         items.retain(|item| {
             item.display_ids().iter().any(|id| k.matches(id)) || k.matches(&item.id)
         });
-        let after: usize = items.iter().map(|i| i.expected_cases()).sum();
-        deselected = before.saturating_sub(after);
     }
 
+    // Apply -m: keep an item whose mark set satisfies the expression. Marks are
+    // matched by exact membership (see `kexpr::KExpr::eval_with`).
+    if let Some(m) = &mexpr {
+        items.retain(|item| {
+            let set: rustc_hash::FxHashSet<&str> = item.marks.iter().map(String::as_str).collect();
+            m.eval_with(&|term: &str| set.contains(term))
+        });
+    }
+
+    // Last-failed record from the previous run. Loaded once: it feeds both
+    // `--lf` (retain) and `--ff` (priority ordering), and the merge-save below.
+    let prev_failed = cache::load_last_failed(&rootdir);
+
+    // --lf: re-run only what failed last time. With no history (empty record)
+    // we run everything, mirroring pytest, and say so unless quiet.
+    if args.last_failed {
+        if prev_failed.is_empty() {
+            if !args.quiet {
+                println!("no previously failed tests; running all");
+            }
+        } else {
+            items.retain(|item| item_matches_failed(item, &prev_failed));
+        }
+    }
+
+    // Combined deselection count across -k/-m/--lf, computed once from the
+    // pre-selection baseline so the summary and JSON report agree.
     let expected_total: usize = items.iter().map(|i| i.expected_cases()).sum();
+    let deselected = before_total.saturating_sub(expected_total);
+
+    // --ff: schedule files containing a previously-failed test first. Built from
+    // the (already -k/-m/--lf-filtered) items so we never prioritize a file that
+    // was deselected this run.
+    let priority_files: FxHashSet<PathBuf> = if args.failed_first {
+        items
+            .iter()
+            .filter(|i| item_matches_failed(i, &prev_failed))
+            .map(|i| i.file.clone())
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
+
     let collect_ms = collect_start.elapsed().as_secs_f64() * 1000.0;
 
     // --- collect-only mode ----------------------------------------------------
@@ -156,6 +208,7 @@ fn run() -> Result<i32> {
         no_capture: args.no_capture,
         maxfail: args.effective_maxfail(),
         timeout: args.timeout.map(std::time::Duration::from_secs_f64),
+        priority_files,
     };
 
     let mut reporter = report::Reporter::new(
@@ -190,6 +243,22 @@ fn run() -> Result<i32> {
                 .unwrap_or(true)
         })
         .collect();
+
+    // Merge-update the last-failed record, pytest-style: start from the prior
+    // set, drop ids that passed this run, and add ids that failed. Starting from
+    // `prev_failed` (rather than rebuilding from scratch) preserves failures in
+    // files we did not run this time — e.g. when a path filter, -k, -m, or --lf
+    // narrowed the selection — so a later bare run still re-runs them under
+    // --lf. Best-effort; never fails the run.
+    let mut merged = prev_failed.clone();
+    for r in &results {
+        if r.outcome.is_bad() {
+            merged.insert(r.id.clone());
+        } else {
+            merged.remove(&r.id);
+        }
+    }
+    cache::save_last_failed(&rootdir, &merged);
 
     // Recompute counts from the filtered set (reporter counted live already;
     // keep them consistent).
@@ -228,4 +297,18 @@ fn run() -> Result<i32> {
     }
 
     Ok(exit_code)
+}
+
+/// Does this collected item correspond to any previously-failed test id?
+/// Failed ids are case ids like `f.py::test[1]`; items are pre-expansion. An
+/// item matches if a failed id's base (`split('[')`) equals the item id, or a
+/// failed id belongs under the item (covers class items and the `*` dynamic
+/// file item whose id is the file path).
+fn item_matches_failed(item: &collect::TestItem, failed: &FxHashSet<String>) -> bool {
+    failed.iter().any(|fid| {
+        let base = fid.split('[').next().unwrap_or(fid);
+        base == item.id
+            || base.starts_with(&format!("{}::", item.id))
+            || fid.starts_with(&format!("{}[", item.id))
+    })
 }

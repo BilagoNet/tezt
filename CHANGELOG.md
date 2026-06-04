@@ -6,6 +6,28 @@ flags can still change between versions.
 
 ## Unreleased
 
+### Added
+
+- **Mark expressions** — `-m "slow and not network"` selects tests by their
+  marks, read statically at collection (no import) from `@pytest.mark.*` /
+  `@tezt.mark.*` decorators and module- / class-level `pytestmark`.
+- **`--lf` / `--ff`** (`--last-failed` / `--failed-first`) — re-run only the
+  tests that failed last run, or run them first. The failing set is recorded in
+  `.tezt_cache` and merged across runs.
+- **Class-scoped and async fixtures** — `@fixture(scope="class")` now has its
+  own lifecycle (built once per class, torn down at the class boundary), and
+  async fixtures are supported, including `async` generators with teardown.
+  Async fixtures and `async def` tests share one per-worker event loop, so a
+  resource created in a fixture is valid inside the test that uses it.
+- **Rich operator-aware assertion diffs** — a failing bare `assert a == b`
+  (and `!=`, `<`, `in`, `is`, …) now prints both operands and a type-aware
+  diff: the differing index of a list, the changed key of a dict, the items
+  unique to each set, a unified diff of two strings. Operands that contain a
+  call fall back to the source-line-plus-locals form, so capturing a value
+  never re-runs your code.
+
+## 0.1.0 — 2026-06-04
+
 The first working version. tezt discovers tests by parsing them in Rust (no
 imports) and runs them on a warm pool of persistent Python workers.
 
