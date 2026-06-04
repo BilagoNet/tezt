@@ -1,7 +1,8 @@
-# Release: build the binary into platform wheels (+ an sdist), attach them to a
-# GitHub Release, and optionally publish to PyPI. Runs only on a version tag
-# (`v1.2.3`) or a manual dispatch — never on ordinary pushes; day-to-day testing
-# is ci.yml. Based on `maturin generate-ci github`, trimmed to mainstream targets.
+# Release: build platform wheels (pip/uv) AND standalone binary archives (curl |
+# sh / direct download), attach everything to the GitHub Release, and publish to
+# PyPI. Runs only on a `v*` tag or a manual dispatch — never on ordinary pushes.
+# A dispatch builds and uploads the artifacts but skips the Release/PyPI steps,
+# which lets us smoke-test the builds without cutting a real release.
 name: Release
 
 on:
@@ -13,71 +14,43 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  linux:
-    runs-on: ubuntu-latest
+  # --- pip/uv wheels (binary wrapped in a wheel via maturin) -----------------
+  wheels:
+    name: wheel ${{ matrix.platform.os }}-${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        platform:
+          - { runner: ubuntu-latest, os: linux, target: x86_64, manylinux: auto }
+          - { runner: ubuntu-24.04-arm, os: linux, target: aarch64, manylinux: auto }
+          - { runner: macos-13, os: macos, target: x86_64, manylinux: "" }
+          - { runner: macos-latest, os: macos, target: aarch64, manylinux: "" }
+          - { runner: windows-latest, os: windows, target: x64, manylinux: "" }
     steps:
       - uses: actions/checkout@v5
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: ${{ matrix.platform.target }}
           args: --release --out dist
-          manylinux: auto
+          manylinux: ${{ matrix.platform.manylinux }}
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux-${{ matrix.target }}
-          path: dist
-
-  macos:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-13 # Intel
-            target: x86_64
-          - runner: macos-latest # Apple Silicon
-            target: aarch64
-    steps:
-      - uses: actions/checkout@v5
-      - name: Build wheel
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-${{ matrix.target }}
-          path: dist
-
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Build wheel
-        uses: PyO3/maturin-action@v1
-        with:
-          target: x64
-          args: --release --out dist
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-x64
+          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
           path: dist
 
   sdist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
@@ -86,35 +59,77 @@ jobs:
           name: wheels-sdist
           path: dist
 
+  # --- standalone binary archives (download + run, no Python needed) ---------
+  binaries:
+    name: binary ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: tar.gz }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: tar.gz }
+          - { runner: macos-13, target: x86_64-apple-darwin, ext: tar.gz }
+          - { runner: macos-latest, target: aarch64-apple-darwin, ext: tar.gz }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          staging="tezt-${{ matrix.target }}"
+          mkdir "$staging"
+          cp README.md LICENSE CHANGELOG.md "$staging"/
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/tezt.exe "$staging"/
+            7z a "$staging.zip" "$staging"
+          else
+            cp target/release/tezt "$staging"/
+            tar czf "$staging.tar.gz" "$staging"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: tezt-${{ matrix.target }}.${{ matrix.ext }}
+
+  # --- assemble the GitHub Release + publish to PyPI (tagged runs only) -------
   release:
     name: Publish
     runs-on: ubuntu-latest
-    needs: [linux, macos, windows, sdist]
+    needs: [wheels, sdist, binaries]
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write # create the GitHub Release
-      id-token: write # PyPI trusted publishing + attestation
+      id-token: write # PyPI trusted publishing + provenance attestation
       attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: wheels-*
           path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
           merge-multiple: true
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: "dist/*"
-      - name: Attach artifacts to the GitHub Release
+          subject-path: "dist/*,binaries/*"
+      - name: Create GitHub Release with wheels + binaries
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* \
+          gh release create "${GITHUB_REF_NAME}" dist/* binaries/* \
             --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes \
-          || gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
-      # Publishing to PyPI uses trusted publishing (no token): configure a PyPI
-      # trusted publisher for this repo + workflow first, then it runs on tag.
-      - name: Publish to PyPI
+          || gh release upload "${GITHUB_REF_NAME}" dist/* binaries/* --repo "${GITHUB_REPOSITORY}" --clobber
+      # Requires a configured PyPI trusted publisher for this repo + workflow.
+      - name: Publish wheels to PyPI
         if: startsWith(github.ref, 'refs/tags/')
         uses: PyO3/maturin-action@v1
         with:

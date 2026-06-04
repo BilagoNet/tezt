@@ -188,20 +188,39 @@ tezt is configured by flags and a few environment variables; there is no config 
 
 ## Installation
 
-For now, build from source with a recent stable Rust toolchain:
+> The one-line and `pip` installs need a published release. Until the first one lands, build
+> from source (last option) — the release pipeline below is wired up and ready.
+
+**One line** — downloads the right prebuilt binary for your platform and puts it on PATH:
+
+```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/BilagoNet/tezt/main/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/BilagoNet/tezt/main/install.ps1 | iex
+```
+
+Set `TEZT_INSTALL_DIR` to pick the location or `TEZT_VERSION` to pin a tag.
+
+**With Python tooling** — the binary ships inside a wheel, so no Rust toolchain is needed:
+
+```sh
+pip install tezt          # or:  uv tool install tezt
+```
+
+**Direct download** — grab a `tezt-<target>.tar.gz` / `.zip` from the
+[Releases](https://github.com/BilagoNet/tezt/releases) page and put the binary on your PATH.
+
+**From source** — any platform with a recent stable Rust toolchain:
 
 ```sh
 git clone https://github.com/BilagoNet/tezt
 cd tezt
-cargo build --release
-# the binary is at ./target/release/tezt
+cargo build --release     # binary at ./target/release/tezt
 ```
-
-You can also build an installable wheel with [maturin](https://www.maturin.rs)
-(`maturin build --release`) — it packages the `tezt` binary so `pip install` drops it on
-your PATH, no Rust toolchain required. Every tagged release builds wheels for Linux, macOS,
-and Windows and attaches them to the GitHub Release; once a version is published to PyPI,
-`pip install tezt` and `uv tool install tezt` work directly.
 
 ## How it works
 

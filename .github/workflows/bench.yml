@@ -1,0 +1,114 @@
+# Benchmarks: run tezt vs pytest (and pytest-xdist) across the full OS x Python
+# matrix, then commit the combined results to bench/MATRIX.md. Triggered manually
+# or weekly — not on every push (it's heavy, and it writes back to the repo).
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: "Number of test files in the generated suite"
+        default: "200"
+      tests_per_file:
+        description: "Tests per file"
+        default: "20"
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bench:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+      - name: Install pytest + xdist
+        run: python -m pip install --upgrade pip pytest pytest-xdist
+      - name: Build tezt (release)
+        run: cargo build --release --locked
+      - name: Resolve binary path
+        id: bin
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "path=target/release/tezt.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=target/release/tezt" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Generate suite
+        run: |
+          python bench/gen_suite.py --out suite_bench \
+            --files "${{ github.event.inputs.files || '200' }}" \
+            --tests-per-file "${{ github.event.inputs.tests_per_file || '20' }}" \
+            --style trivial --flavor plain
+      - name: Run benchmark
+        env:
+          TEZT_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          mkdir -p out
+          python bench/run_bench.py \
+            --tezt-bin "${{ steps.bin.outputs.path }}" \
+            --suite suite_bench \
+            --label "${{ matrix.os }}-py${{ matrix.python }}" \
+            --runs 5 --jobs 4 \
+            --out out/result.json
+          cp out/result.json "out/${{ matrix.os }}__py${{ matrix.python }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}-py${{ matrix.python }}
+          path: out/${{ matrix.os }}__py${{ matrix.python }}.json
+
+  publish:
+    name: Commit results
+    needs: bench
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: incoming
+          merge-multiple: true
+      - name: Assemble bench/MATRIX.md
+        run: python bench/assemble_matrix.py incoming bench/MATRIX.md
+      - name: Commit results back to the repo
+        run: |
+          git config user.name "tezt-bench[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bench/MATRIX.md
+          if git diff --cached --quiet; then
+            echo "No benchmark changes to commit."
+          else
+            git commit -m "bench: refresh OS x Python matrix results [skip ci]"
+            git push
+          fi
