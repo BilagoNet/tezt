@@ -16,11 +16,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 31 ms | 128.4x |
-| collect | pytest collect | 3945 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 283 ms | 19.4x |
-| full run | pytest | 5488 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 9711 ms | 0.6x |
+| collect | tezt collect | 24 ms | 241.4x |
+| collect | pytest collect | 5807 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 448 ms | 20.2x |
+| full run | pytest | 9040 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 11264 ms | 0.8x |
 
 ## macos-latest / py3.11
 
@@ -32,11 +32,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 64 ms | 60.8x |
-| collect | pytest collect | 3910 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 310 ms | 14.2x |
-| full run | pytest | 4395 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 8144 ms | 0.5x |
+| collect | tezt collect | 37 ms | 123.0x |
+| collect | pytest collect | 4511 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 242 ms | 26.3x |
+| full run | pytest | 6364 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 10674 ms | 0.6x |
 
 ## macos-latest / py3.12
 
@@ -48,11 +48,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 27 ms | 198.2x |
-| collect | pytest collect | 5267 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 361 ms | 15.5x |
-| full run | pytest | 5606 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 9938 ms | 0.6x |
+| collect | tezt collect | 15 ms | 237.5x |
+| collect | pytest collect | 3679 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 217 ms | 21.6x |
+| full run | pytest | 4687 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 6565 ms | 0.7x |
 
 ## macos-latest / py3.13
 
@@ -64,11 +64,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 18 ms | 185.7x |
-| collect | pytest collect | 3262 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 200 ms | 22.9x |
-| full run | pytest | 4580 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 6005 ms | 0.8x |
+| collect | tezt collect | 30 ms | 140.1x |
+| collect | pytest collect | 4267 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 294 ms | 25.4x |
+| full run | pytest | 7490 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 7702 ms | 1.0x |
 
 ## macos-latest / py3.9
 
@@ -80,11 +80,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 36 ms | 221.0x |
-| collect | pytest collect | 7917 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 393 ms | 26.8x |
-| full run | pytest | 10546 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 12021 ms | 0.9x |
+| collect | tezt collect | 14 ms | 293.8x |
+| collect | pytest collect | 4138 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 216 ms | 23.9x |
+| full run | pytest | 5161 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 7387 ms | 0.7x |
 
 ## ubuntu-latest / py3.10
 
@@ -96,11 +96,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 25 ms | 221.9x |
-| collect | pytest collect | 5626 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 349 ms | 21.4x |
-| full run | pytest | 7479 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 14200 ms | 0.5x |
+| collect | tezt collect | 24 ms | 227.8x |
+| collect | pytest collect | 5419 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 327 ms | 22.2x |
+| full run | pytest | 7260 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 12729 ms | 0.6x |
 
 ## ubuntu-latest / py3.11
 
@@ -112,11 +112,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 28 ms | 177.7x |
-| collect | pytest collect | 5011 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 352 ms | 20.2x |
-| full run | pytest | 7093 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 11722 ms | 0.6x |
+| collect | tezt collect | 28 ms | 188.2x |
+| collect | pytest collect | 5214 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 357 ms | 20.4x |
+| full run | pytest | 7287 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 11974 ms | 0.6x |
 
 ## ubuntu-latest / py3.12
 
@@ -128,11 +128,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 31 ms | 190.1x |
-| collect | pytest collect | 5851 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 466 ms | 16.6x |
-| full run | pytest | 7729 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 12485 ms | 0.6x |
+| collect | tezt collect | 21 ms | 219.4x |
+| collect | pytest collect | 4621 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 381 ms | 16.0x |
+| full run | pytest | 6087 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 10273 ms | 0.6x |
 
 ## ubuntu-latest / py3.13
 
@@ -144,11 +144,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 27 ms | 220.7x |
-| collect | pytest collect | 5869 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 507 ms | 15.8x |
-| full run | pytest | 8025 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 13835 ms | 0.6x |
+| collect | tezt collect | 26 ms | 218.9x |
+| collect | pytest collect | 5782 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 502 ms | 16.1x |
+| full run | pytest | 8065 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 13674 ms | 0.6x |
 
 ## ubuntu-latest / py3.14
 
@@ -160,11 +160,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 22 ms | 209.9x |
-| collect | pytest collect | 4699 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 430 ms | 14.1x |
-| full run | pytest | 6057 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 9990 ms | 0.6x |
+| collect | tezt collect | 27 ms | 225.6x |
+| collect | pytest collect | 6118 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 587 ms | 14.1x |
+| full run | pytest | 8266 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 14540 ms | 0.6x |
 
 ## ubuntu-latest / py3.9
 
@@ -176,11 +176,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 26 ms | 221.1x |
-| collect | pytest collect | 5847 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 369 ms | 22.8x |
-| full run | pytest | 8432 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 14449 ms | 0.6x |
+| collect | tezt collect | 33 ms | 178.7x |
+| collect | pytest collect | 5915 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 346 ms | 23.6x |
+| full run | pytest | 8159 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 13290 ms | 0.6x |
 
 ## windows-latest / py3.10
 
@@ -192,11 +192,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 30 ms | 147.5x |
-| collect | pytest collect | 4485 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 357 ms | 19.0x |
-| full run | pytest | 6783 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 10311 ms | 0.7x |
+| collect | tezt collect | 43 ms | 150.5x |
+| collect | pytest collect | 6489 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 557 ms | 18.4x |
+| full run | pytest | 10225 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 15162 ms | 0.7x |
 
 ## windows-latest / py3.11
 
@@ -208,11 +208,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 36 ms | 150.1x |
-| collect | pytest collect | 5463 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 483 ms | 17.9x |
-| full run | pytest | 8657 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 13150 ms | 0.7x |
+| collect | tezt collect | 42 ms | 149.4x |
+| collect | pytest collect | 6331 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 471 ms | 18.3x |
+| full run | pytest | 8625 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 12964 ms | 0.7x |
 
 ## windows-latest / py3.12
 
@@ -224,11 +224,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 25 ms | 143.4x |
-| collect | pytest collect | 3518 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 352 ms | 12.9x |
-| full run | pytest | 4533 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 7872 ms | 0.6x |
+| collect | tezt collect | 41 ms | 150.7x |
+| collect | pytest collect | 6207 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 611 ms | 15.0x |
+| full run | pytest | 9154 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 13907 ms | 0.7x |
 
 ## windows-latest / py3.13
 
@@ -240,11 +240,11 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 39 ms | 144.9x |
-| collect | pytest collect | 5634 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 607 ms | 14.7x |
-| full run | pytest | 8911 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 13285 ms | 0.7x |
+| collect | tezt collect | 42 ms | 129.2x |
+| collect | pytest collect | 5386 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 585 ms | 14.2x |
+| full run | pytest | 8323 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 12676 ms | 0.7x |
 
 ## windows-latest / py3.9
 
@@ -256,8 +256,8 @@ same phase.
 
 | phase | runner | median | speedup vs pytest |
 |---|---|--:|--:|
-| collect | tezt collect | 37 ms | 151.4x |
-| collect | pytest collect | 5600 ms | 1.0x (baseline) |
-| full run | tezt -j 4 | 490 ms | 18.7x |
-| full run | pytest | 9183 ms | 1.0x (baseline) |
-| full run | pytest -n 4 (xdist) | 13515 ms | 0.7x |
+| collect | tezt collect | 36 ms | 153.3x |
+| collect | pytest collect | 5504 ms | 1.0x (baseline) |
+| full run | tezt -j 4 | 483 ms | 19.2x |
+| full run | pytest | 9260 ms | 1.0x (baseline) |
+| full run | pytest -n 4 (xdist) | 13787 ms | 0.7x |
